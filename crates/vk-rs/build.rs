@@ -6,6 +6,10 @@ use std::{
 use spirv_builder::{MetadataPrintout, SpirvBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Tell Cargo to rerun this script if the shaders crate or its contents change
+    println!("cargo:rerun-if-changed=../shaders/src");
+    println!("cargo:rerun-if-changed=../shaders/Cargo.toml");
+
     SpirvBuilder::new("../shaders/", "spirv-unknown-vulkan1.2")
         .print_metadata(MetadataPrintout::None)
         .multimodule(true)

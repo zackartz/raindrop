@@ -3,6 +3,7 @@ use ash::{
     vk::{self, Buffer},
     Device,
 };
+use color_eyre::owo_colors::Color;
 use egui_ash::EguiCommand;
 use glam::{Mat4, Vec3};
 use gpu_allocator::vulkan::{Allocation, Allocator};
@@ -104,6 +105,8 @@ pub struct RendererInner {
     camera_fov: f32,
     camera_yaw: f32,
     camera_pitch: f32,
+    bg_color: Vec3,
+    model_color: Vec3,
     accumulation_reset_needed: bool,
 }
 
@@ -199,12 +202,13 @@ impl RendererInner {
         (swapchain, surface_format, surface_extent, swapchain_images)
     }
 
-    fn create_uniform_buffers(
+    fn create_uniform_buffers<T: Sized>(
         device: &Device,
         allocator: Arc<Mutex<Allocator>>,
         swapchain_count: usize,
     ) -> (Vec<Buffer>, Vec<Allocation>) {
-        let buffer_size = std::mem::size_of::<UniformBufferObject>() as u64;
+        let buffer_size = std::mem::size_of::<T>() as u64;
+
         let buffer_usage = vk::BufferUsageFlags::UNIFORM_BUFFER;
         let buffer_create_info = vk::BufferCreateInfo::builder()
             .size(buffer_size)
@@ -269,7 +273,7 @@ impl RendererInner {
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX);
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
         let ubo_layout_create_info = vk::DescriptorSetLayoutCreateInfo::builder()
             .bindings(std::slice::from_ref(&ubo_layout_binding));
 
@@ -300,7 +304,8 @@ impl RendererInner {
             let buffer_info = vk::DescriptorBufferInfo::builder()
                 .buffer(uniform_buffers[index])
                 .offset(0)
-                .range(vk::WHOLE_SIZE);
+                .range(vk::WHOLE_SIZE)
+                .build();
             let descriptor_write = vk::WriteDescriptorSet::builder()
                 .dst_set(descriptor_sets[index])
                 .dst_binding(0)
@@ -535,8 +540,8 @@ impl RendererInner {
             .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
-            .cull_mode(vk::CullModeFlags::NONE)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
             .depth_bias_enable(false)
             .line_width(1.0);
         let stencil_op = vk::StencilOpState::builder()
@@ -546,7 +551,7 @@ impl RendererInner {
         let depth_stencil_info = vk::PipelineDepthStencilStateCreateInfo::builder()
             .depth_test_enable(true)
             .depth_write_enable(true)
-            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+            .depth_compare_op(vk::CompareOp::LESS)
             .depth_bounds_test_enable(false)
             .stencil_test_enable(false)
             .front(*stencil_op)
@@ -792,36 +797,32 @@ impl RendererInner {
         swapchain_count: usize,
     ) -> (Vec<vk::Fence>, Vec<vk::Semaphore>, Vec<vk::Semaphore>) {
         let fence_create_info =
-            vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
-        let mut in_flight_fences = vec![];
+            vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED); // Start signaled
+
+        let semaphore_create_info = vk::SemaphoreCreateInfo::builder();
+
+        let mut in_flight_fences = Vec::with_capacity(swapchain_count);
+        let mut image_available_semaphores = Vec::with_capacity(swapchain_count);
+        let mut render_finished_semaphores = Vec::with_capacity(swapchain_count);
+
         for _ in 0..swapchain_count {
-            let fence = unsafe {
-                device
+            unsafe {
+                let fence = device
                     .create_fence(&fence_create_info, None)
-                    .expect("Failed to create fence")
-            };
-            in_flight_fences.push(fence);
-        }
-        let mut image_available_semaphores = vec![];
-        for _ in 0..swapchain_count {
-            let semaphore_create_info = vk::SemaphoreCreateInfo::builder();
-            let semaphore = unsafe {
-                device
+                    .expect("Failed to create fence");
+                let image_available = device
                     .create_semaphore(&semaphore_create_info, None)
-                    .expect("Failed to create semaphore")
-            };
-            image_available_semaphores.push(semaphore);
-        }
-        let mut render_finished_semaphores = vec![];
-        for _ in 0..swapchain_count {
-            let semaphore_create_info = vk::SemaphoreCreateInfo::builder();
-            let semaphore = unsafe {
-                device
+                    .expect("Failed to create semaphore");
+                let render_finished = device
                     .create_semaphore(&semaphore_create_info, None)
-                    .expect("Failed to create semaphore")
-            };
-            render_finished_semaphores.push(semaphore);
+                    .expect("Failed to create semaphore");
+
+                in_flight_fences.push(fence);
+                image_available_semaphores.push(image_available);
+                render_finished_semaphores.push(render_finished);
+            }
         }
+
         (
             in_flight_fences,
             image_available_semaphores,
@@ -1004,7 +1005,12 @@ impl RendererInner {
             height,
         );
         let (uniform_buffers, uniform_buffer_allocations) =
-            Self::create_uniform_buffers(&device, allocator.clone(), swapchain_images.len());
+            Self::create_uniform_buffers::<UniformBufferObject>(
+                &device,
+                allocator.clone(),
+                swapchain_images.len(),
+            );
+
         let descriptor_pool = Self::create_descriptor_pool(&device, swapchain_images.len());
         let descriptor_set_layouts =
             Self::create_descriptor_set_layouts(&device, swapchain_images.len());
@@ -1083,7 +1089,24 @@ impl RendererInner {
             camera_yaw: 0.,
             camera_pitch: 0.,
             camera_fov: 45.,
+            bg_color: Vec3::splat(0.1),
+            model_color: Vec3::splat(0.8),
             accumulation_reset_needed: true,
+        }
+    }
+
+    pub fn update_colors(&mut self, bg_color: Vec3, model_color: Vec3) {
+        let bg_color = clamped_color(bg_color);
+        let model_color = clamped_color(model_color);
+
+        if bg_color != self.bg_color {
+            self.bg_color = bg_color;
+            self.accumulation_reset_needed = true;
+        }
+
+        if model_color != self.model_color {
+            self.model_color = model_color;
+            self.accumulation_reset_needed = true;
         }
     }
 
@@ -1121,23 +1144,21 @@ impl RendererInner {
             self.recreate_swapchain(width, height, &mut egui_cmd);
         }
 
-        let result = unsafe {
-            puffin::profile_scope!("acquire_next_image");
-            self.swapchain_loader.acquire_next_image(
-                self.swapchain,
-                u64::MAX,
-                self.image_available_semaphores[self.current_frame],
-                vk::Fence::null(),
-            )
-        };
-        let index = match result {
-            Ok((index, _)) => index as usize,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.dirty_swapchain = true;
-                return;
-            }
-            Err(_) => return,
-        };
+        // unsafe {
+        //     self.device
+        //         .wait_for_fences(
+        //             std::slice::from_ref(&self.in_flight_fences[self.current_frame]),
+        //             true,
+        //             u64::MAX,
+        //         )
+        //         .expect("failed to wait for fences");
+        //
+        //     self.device
+        //         .reset_fences(std::slice::from_ref(
+        //             &self.in_flight_fences[self.current_frame],
+        //         ))
+        //         .expect("failed to reset fences");
+        // }
 
         unsafe {
             puffin::profile_scope!("wait_for_fences");
@@ -1155,6 +1176,24 @@ impl RendererInner {
             ))
         }
         .expect("Failed to reset fences");
+
+        let result = unsafe {
+            puffin::profile_scope!("acquire_next_image");
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_available_semaphores[self.current_frame],
+                vk::Fence::null(),
+            )
+        };
+        let index = match result {
+            Ok((index, _)) => index as usize,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.dirty_swapchain = true;
+                return;
+            }
+            Err(_) => return,
+        };
 
         let view = {
             puffin::profile_scope!("calculate_view");
@@ -1180,6 +1219,7 @@ impl RendererInner {
                 0.1,
                 10.0,
             ),
+            model_color: self.model_color,
         };
 
         unsafe {
@@ -1215,7 +1255,7 @@ impl RendererInner {
                     .clear_values(&[
                         vk::ClearValue {
                             color: vk::ClearColorValue {
-                                float32: [0.4, 0.3, 0.2, 1.0],
+                                float32: [self.bg_color.x, self.bg_color.y, self.bg_color.z, 1.0],
                             },
                         },
                         vk::ClearValue {
@@ -1388,6 +1428,7 @@ impl RendererInner {
             for allocation in self.uniform_buffer_allocations.drain(..) {
                 allocator.free(allocation).expect("Failed to free memory");
             }
+
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
         }
@@ -1435,4 +1476,12 @@ impl Renderer {
     pub fn destroy(&mut self) {
         self.inner.lock().unwrap().destroy();
     }
+}
+
+fn clamped_color(color: Vec3) -> Vec3 {
+    Vec3::new(
+        color.x.clamp(0.0, 1.0),
+        color.y.clamp(0.0, 1.0),
+        color.z.clamp(0.0, 1.0),
+    )
 }

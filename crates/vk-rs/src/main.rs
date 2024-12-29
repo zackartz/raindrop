@@ -13,6 +13,7 @@ use ash::{
     vk::{self, KhrAccelerationStructureFn, KhrDeferredHostOperationsFn, KhrRayTracingPipelineFn},
     Device, Entry, Instance,
 };
+use egui::widgets;
 use egui_ash::{
     raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle},
     winit, App, AppCreator, AshRenderState, CreationContext, HandleRedraw, RunOption, Theme,
@@ -52,6 +53,9 @@ struct Game {
     last_fps_update: std::time::Instant,
     frame_count_since_last_update: i32,
     current_fps: f32,
+
+    bg_color: [f32; 3],
+    model_color: [f32; 3],
 
     show_profiler: bool,
 }
@@ -112,6 +116,12 @@ impl App for Game {
                 10.0..=150.0,
             ));
             ui.separator();
+
+            ui.color_edit_button_rgb(&mut self.bg_color);
+            ui.color_edit_button_rgb(&mut self.model_color);
+
+            ui.separator();
+
             if ui.button("Show Profiler").clicked() {
                 self.show_profiler = !self.show_profiler;
             }
@@ -220,9 +230,13 @@ impl App for Game {
             let camera_yaw = self.camera_yaw;
             let camera_pitch = self.camera_pitch;
             let camera_fov = self.camera_fov;
+
+            let bg_color = self.bg_color;
+            let model_color = self.model_color;
             move |size, egui_cmd| {
                 let mut renderer = renderer.inner.lock().unwrap();
                 renderer.update_camera(camera_position, camera_yaw, camera_pitch, camera_fov);
+                renderer.update_colors(bg_color.into(), model_color.into());
                 renderer.render(size.width, size.height, egui_cmd, rotate_y)
             }
         }))
@@ -626,6 +640,8 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
             camera_pitch: 0.,
             camera_yaw: 0.,
             camera_fov: 45.,
+            bg_color: Vec3::splat(0.1).into(),
+            model_color: Vec3::splat(0.8).into(),
             last_mouse_pos: None,
             right_mouse_pressed: false,
             last_fps_update: std::time::Instant::now(),

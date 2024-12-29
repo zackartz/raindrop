@@ -32,8 +32,13 @@ pub fn main_vs(
 }
 
 #[spirv(fragment)]
-pub fn main_fs(frag_world_position: Vec3, frag_world_normal: Vec3, out_color: &mut Vec4) {
-    let base_color = Vec3::new(1.0, 0.5, 0.5);
+pub fn main_fs(
+    frag_world_position: Vec3,
+    frag_world_normal: Vec3,
+    out_color: &mut Vec4,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] ubo: &UniformBufferObject,
+) {
+    let base_color = ubo.model_color;
     let light_pos = Vec3::new(2.0, 2.0, -2.0);
 
     // Calculate light direction

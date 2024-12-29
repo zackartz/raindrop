@@ -45,6 +45,7 @@ struct Game {
     camera_position: Vec3,
     camera_yaw: f32,
     camera_pitch: f32,
+    camera_fov: f32,
     right_mouse_pressed: bool,
     last_mouse_pos: Option<(f32, f32)>,
 
@@ -105,6 +106,12 @@ impl App for Game {
                 ui.add(egui::DragValue::new(&mut self.camera_position.z).speed(0.1));
             });
             ui.separator();
+            ui.label("FOV");
+            ui.add(egui::widgets::Slider::new(
+                &mut self.camera_fov,
+                10.0..=150.0,
+            ));
+            ui.separator();
             if ui.button("Show Profiler").clicked() {
                 self.show_profiler = !self.show_profiler;
             }
@@ -114,12 +121,19 @@ impl App for Game {
         if !ctx.wants_keyboard_input() {
             let movement_speed = 0.1;
 
-            let forward = Vec3::new(self.camera_yaw.sin(), 0.0, self.camera_yaw.cos()).normalize();
+            // Calculate forward direction using yaw
+            let forward = Vec3::new(
+                self.camera_yaw.sin(),
+                self.camera_pitch.sin(),
+                self.camera_yaw.cos(),
+            )
+            .normalize();
 
+            // Calculate right direction
             let right = Vec3::new(
-                (self.camera_yaw + 90.0_f32.to_radians()).sin(),
+                (self.camera_yaw + std::f32::consts::FRAC_PI_2).sin(),
                 0.0,
-                (self.camera_yaw + 90.0_f32.to_radians()).cos(),
+                (self.camera_yaw + std::f32::consts::FRAC_PI_2).cos(),
             )
             .normalize();
 
@@ -141,6 +155,7 @@ impl App for Game {
 
         // Handle mouse input for camera rotation
         let is_right_mouse_down = ctx.input(|i| i.pointer.secondary_down());
+        let is_middle_mouse_down = ctx.input(|i| i.pointer.middle_down());
         let hover_pos = ctx.input(|i| i.pointer.hover_pos());
 
         // Set cursor visibility based on right mouse button
@@ -154,22 +169,40 @@ impl App for Game {
 
         self.right_mouse_pressed = is_right_mouse_down;
 
-        if self.right_mouse_pressed {
-            if let Some(pos) = hover_pos {
-                if let Some((last_x, last_y)) = self.last_mouse_pos {
-                    let delta_x = pos.x - last_x;
-                    let delta_y = pos.y - last_y;
+        match (self.right_mouse_pressed, is_middle_mouse_down) {
+            (true, false) => {
+                if let Some(pos) = hover_pos {
+                    if let Some((last_x, last_y)) = self.last_mouse_pos {
+                        let delta_x = pos.x - last_x;
+                        let delta_y = pos.y - last_y;
 
-                    // Update camera rotation
-                    let rotation_speed = 0.002;
-                    self.camera_yaw -= delta_x * rotation_speed;
-                    self.camera_pitch = (self.camera_pitch + delta_y * rotation_speed)
-                        .clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
+                        // Update camera rotation
+                        let rotation_speed = 0.002;
+                        self.camera_yaw -= delta_x * rotation_speed;
+                        self.camera_pitch = (self.camera_pitch + delta_y * rotation_speed)
+                            .clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
+                    }
+                    self.last_mouse_pos = Some((pos.x, pos.y));
                 }
-                self.last_mouse_pos = Some((pos.x, pos.y));
             }
-        } else {
-            self.last_mouse_pos = None;
+            (false, true) => {
+                if let Some(pos) = hover_pos {
+                    if let Some((last_x, last_y)) = self.last_mouse_pos {
+                        let delta_x = pos.x - last_x;
+                        let delta_y = pos.y - last_y;
+
+                        let move_speed = 0.005;
+
+                        self.camera_position.x -= delta_x * move_speed;
+                        self.camera_position.y += delta_y * move_speed;
+                    }
+
+                    self.last_mouse_pos = Some((pos.x, pos.y))
+                }
+            }
+            _ => {
+                self.last_mouse_pos = None;
+            }
         }
 
         match self.theme {
@@ -186,9 +219,10 @@ impl App for Game {
             let camera_position = self.camera_position;
             let camera_yaw = self.camera_yaw;
             let camera_pitch = self.camera_pitch;
+            let camera_fov = self.camera_fov;
             move |size, egui_cmd| {
                 let mut renderer = renderer.inner.lock().unwrap();
-                renderer.update_camera(camera_position, camera_yaw, camera_pitch);
+                renderer.update_camera(camera_position, camera_yaw, camera_pitch, camera_fov);
                 renderer.render(size.width, size.height, egui_cmd, rotate_y)
             }
         }))
@@ -521,7 +555,7 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
         }
         let (
             physical_device,
-            physical_device_properties,
+            _physical_device_properties,
             _physical_device_memory_properties,
             queue_family_index,
         ) = Self::create_physical_device(&instance, &surface_loader, surface, &req_ext);
@@ -591,6 +625,7 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
             camera_position: Vec3::new(0.0, 0.0, -5.0),
             camera_pitch: 0.,
             camera_yaw: 0.,
+            camera_fov: 45.,
             last_mouse_pos: None,
             right_mouse_pressed: false,
             last_fps_update: std::time::Instant::now(),

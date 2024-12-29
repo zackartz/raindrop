@@ -3,7 +3,6 @@ use ash::{
     vk::{self, Buffer},
     Device,
 };
-use cgmath::num_traits::Float;
 use egui_ash::EguiCommand;
 use glam::{Mat4, Vec3};
 use gpu_allocator::vulkan::{Allocation, Allocator};
@@ -102,6 +101,7 @@ pub struct RendererInner {
 
     frame_counter: u32,
     camera_position: Vec3,
+    camera_fov: f32,
     camera_yaw: f32,
     camera_pitch: f32,
     accumulation_reset_needed: bool,
@@ -1082,18 +1082,21 @@ impl RendererInner {
             camera_position: Vec3::new(0.0, 0.0, -5.0),
             camera_yaw: 0.,
             camera_pitch: 0.,
+            camera_fov: 45.,
             accumulation_reset_needed: true,
         }
     }
 
-    pub fn update_camera(&mut self, new_position: Vec3, yaw: f32, pitch: f32) {
+    pub fn update_camera(&mut self, new_position: Vec3, yaw: f32, pitch: f32, fov: f32) {
         if (new_position - self.camera_position).length() > 0.0001
             || (yaw - self.camera_yaw).abs() > 0.001
             || (pitch - self.camera_pitch).abs() > 0.001
+            || (fov - self.camera_fov).abs() > 0.001
         {
             self.camera_position = new_position;
             self.camera_yaw = yaw;
             self.camera_pitch = pitch;
+            self.camera_fov = fov;
             self.accumulation_reset_needed = true;
         }
     }
@@ -1172,7 +1175,7 @@ impl RendererInner {
             model: Mat4::from_rotation_y(rotate_y.to_radians()),
             view,
             proj: Mat4::perspective_rh(
-                45.0_f32.to_radians(),
+                self.camera_fov.to_radians(),
                 width as f32 / height as f32,
                 0.1,
                 10.0,

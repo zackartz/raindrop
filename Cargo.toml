@@ -46,3 +46,4 @@ codegen-units = 256
 #
 # rustflags = ["-Zshare-generics=off"]
 codegen-units = 1
+opt-level = 3

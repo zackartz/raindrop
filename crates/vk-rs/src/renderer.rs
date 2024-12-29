@@ -607,7 +607,7 @@ impl RendererInner {
         let mut allocator = allocator.lock().unwrap();
         let vertices = {
             let model_obj = tobj::load_obj(
-                "/home/zoey/dev/vk-rs/crates/vk-rs/assets/suzanne.obj",
+                "./crates/vk-rs/assets/suzanne.obj",
                 &tobj::LoadOptions {
                     single_index: true,
                     triangulate: true,

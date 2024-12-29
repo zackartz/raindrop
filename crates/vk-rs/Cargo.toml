@@ -22,6 +22,7 @@ puffin_egui = { git = "https://github.com/EmbarkStudios/puffin", rev = "5ac4e541
 gpu-profiler = { git = "https://github.com/zackartz/gpu-profiler", features = [
   "use-ash",
 ] }
+gltf = { version = "1.4.1", features = ["import"] }
 
 [build-dependencies]
 spirv-builder.workspace = true

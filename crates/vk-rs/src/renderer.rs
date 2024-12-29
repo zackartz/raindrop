@@ -1,16 +1,18 @@
 use ash::{
     extensions::khr::{Surface, Swapchain},
-    vk::{self, Buffer},
+    vk::{self, Buffer, ImageAspectFlags},
     Device,
 };
-use color_eyre::owo_colors::Color;
+use egui::Vec2;
 use egui_ash::EguiCommand;
 use glam::{Mat4, Vec3};
-use gpu_allocator::vulkan::{Allocation, Allocator};
+use gltf::json::buffer::View;
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator};
 use shaders_shared::UniformBufferObject;
 use std::{
     ffi::CString,
     mem::ManuallyDrop,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -34,6 +36,7 @@ macro_rules! include_spirv {
 struct Vertex {
     position: Vec3,
     normal: Vec3,
+    tex_coords: Vec2,
 }
 impl Vertex {
     fn get_binding_descriptions() -> [vk::VertexInputBindingDescription; 1] {
@@ -44,7 +47,7 @@ impl Vertex {
             .build()]
     }
 
-    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         [
             vk::VertexInputAttributeDescription::builder()
                 .binding(0)
@@ -58,8 +61,603 @@ impl Vertex {
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(4 * 3)
                 .build(),
+            vk::VertexInputAttributeDescription::builder()
+                .binding(0)
+                .location(2)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(24)
+                .build(),
         ]
     }
+}
+
+pub struct Texture {
+    image: vk::Image,
+    image_allocation: Option<Allocation>,
+    image_view: vk::ImageView,
+    sampler: vk::Sampler,
+}
+
+impl Texture {
+    fn new(
+        device: &Device,
+        allocator: Arc<Mutex<Allocator>>,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        width: u32,
+        height: u32,
+        data: &[u8],
+    ) -> Self {
+        let mut allocator = allocator.lock().unwrap();
+
+        let buffer_size = data.len() as u64;
+        let staging_buffer = unsafe {
+            device
+                .create_buffer(
+                    &vk::BufferCreateInfo::builder()
+                        .size(buffer_size)
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC),
+                    None,
+                )
+                .expect("failed to create_buffer")
+        };
+
+        let staging_allocation = allocator
+            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "staging_buffer",
+                requirements: unsafe { device.get_buffer_memory_requirements(staging_buffer) },
+                location: gpu_allocator::MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            })
+            .expect("failed to allocate memory");
+
+        unsafe {
+            device
+                .bind_buffer_memory(
+                    staging_buffer,
+                    staging_allocation.memory(),
+                    staging_allocation.offset(),
+                )
+                .expect("failed to bind_buffer_memory");
+
+            let ptr = staging_allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+            ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
+        }
+
+        let image = unsafe {
+            device
+                .create_image(
+                    &vk::ImageCreateInfo::builder()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_SRGB)
+                        .extent(vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )
+                .expect("failed to create image")
+        };
+
+        let image_allocation = allocator
+            .allocate(&AllocationCreateDesc {
+                name: "texture image",
+                requirements: unsafe { device.get_image_memory_requirements(image) },
+                location: gpu_allocator::MemoryLocation::GpuOnly,
+                linear: true,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            })
+            .expect("failed to allocate memory");
+
+        unsafe {
+            device
+                .bind_image_memory(image, image_allocation.memory(), image_allocation.offset())
+                .expect("failed to bind image memory")
+        };
+
+        let command_buffer = unsafe {
+            let command_buffer = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::builder()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .expect("failed to allocate command_buffer")[0];
+
+            device
+                .begin_command_buffer(
+                    command_buffer,
+                    &vk::CommandBufferBeginInfo::builder()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .expect("failed to begin_command_buffer");
+
+            let barrier = vk::ImageMemoryBarrier::builder()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier.build()],
+            );
+
+            let region = vk::BufferImageCopy::builder()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+
+            device.cmd_copy_buffer_to_image(
+                command_buffer,
+                staging_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region.build()],
+            );
+
+            let barrier = vk::ImageMemoryBarrier::builder()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier.build()],
+            );
+
+            device
+                .end_command_buffer(command_buffer)
+                .expect("failed to end the command buffer");
+
+            device
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::builder()
+                        .command_buffers(&[command_buffer])
+                        .build()],
+                    vk::Fence::null(),
+                )
+                .expect("failed to submit queue");
+
+            device.queue_wait_idle(queue).expect("failed to wait queue");
+
+            device.free_command_buffers(command_pool, &[command_buffer]);
+
+            device.destroy_buffer(staging_buffer, None);
+            allocator
+                .free(staging_allocation)
+                .expect("failed to free memory");
+        };
+
+        let image_view = unsafe {
+            device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::builder()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8G8B8A8_SRGB)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .expect("failed to create image view")
+        };
+
+        let sampler = unsafe {
+            device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::builder()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+                        .anisotropy_enable(true)
+                        .max_anisotropy(16.0)
+                        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+                        .unnormalized_coordinates(false)
+                        .compare_enable(false)
+                        .compare_op(vk::CompareOp::ALWAYS)
+                        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                        .mip_lod_bias(0.0)
+                        .min_lod(0.0)
+                        .max_lod(0.0),
+                    None,
+                )
+                .expect("failed to create sampler")
+        };
+
+        Self {
+            image,
+            image_allocation: Some(image_allocation),
+            image_view,
+            sampler,
+        }
+    }
+
+    fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
+        unsafe {
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_image_view(self.image_view, None);
+            device.destroy_image(self.image, None);
+        }
+        if let Some(allocation) = self.image_allocation.take() {
+            allocator.free(allocation).expect("failed to free memory");
+        }
+    }
+}
+
+pub struct Mesh {
+    vertex_buffer: Buffer,
+    vertex_buffer_allocation: Option<Allocation>,
+    vertex_count: u32,
+    transform: Mat4,
+    texture: Option<Texture>,
+}
+
+pub struct Model {
+    meshes: Vec<Mesh>,
+}
+
+fn load_texture_from_gltf(
+    device: &Device,
+    allocator: Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    texture: &gltf::Texture,
+    buffers: &[gltf::buffer::Data],
+    path: &Path,
+) -> Option<Texture> {
+    let image = texture.source();
+    let data = match image.source() {
+        gltf::image::Source::View { view, .. } => {
+            // Handle embedded buffer view
+            match view.buffer().source() {
+                gltf::buffer::Source::Bin => {
+                    let start = view.offset();
+                    let end = start + view.length();
+                    buffers[0][start..end].to_vec()
+                }
+                _ => return None,
+            }
+        }
+        gltf::image::Source::Uri { .. } => {
+            // For URI sources, we'll get the data directly from gltf::image::Data
+            let img_data =
+                gltf::image::Data::from_source(image.source(), Some(path), buffers).ok()?;
+            img_data.pixels.clone().to_vec()
+        }
+    };
+
+    let img_data = gltf::image::Data::from_source(image.source(), Some(path), buffers).ok()?;
+
+    Some(Texture::new(
+        device,
+        allocator,
+        command_pool,
+        queue,
+        img_data.width,
+        img_data.height,
+        &data,
+    ))
+}
+
+impl Model {
+    fn load(
+        device: &Device,
+        allocator: Arc<Mutex<Allocator>>,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        path: &str,
+    ) -> Self {
+        let path = Path::new(path);
+        let base_path = path.parent();
+        let (document, buffers, _) = gltf::import(path).expect("failed to load GLTF");
+        let mut meshes = Vec::new();
+
+        for scene in document.scenes() {
+            for node in scene.nodes() {
+                meshes.extend(process_node(
+                    node,
+                    Mat4::IDENTITY,
+                    &buffers,
+                    device,
+                    allocator.clone(),
+                    command_pool,
+                    queue,
+                    base_path.unwrap(),
+                ));
+            }
+        }
+
+        Self { meshes }
+    }
+}
+
+fn process_node(
+    node: gltf::Node,
+    parent_transform: Mat4,
+    buffers: &[gltf::buffer::Data],
+    device: &Device,
+    allocator: Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    path: &Path,
+) -> Vec<Mesh> {
+    let mut meshes = Vec::new();
+
+    let local_transform = {
+        let (translation, rotation, scale) = node.transform().decomposed();
+        Mat4::from_scale_rotation_translation(
+            Vec3::from(scale),
+            glam::Quat::from_array(rotation),
+            Vec3::from(translation),
+        )
+    };
+    let world_transform = parent_transform * local_transform;
+
+    if let Some(mesh) = node.mesh() {
+        for primitive in mesh.primitives() {
+            let texture = primitive
+                .material()
+                .pbr_metallic_roughness()
+                .base_color_texture()
+                .and_then(|tex| {
+                    load_texture_from_gltf(
+                        device,
+                        allocator.clone(),
+                        command_pool,
+                        queue,
+                        &tex.texture(),
+                        buffers,
+                        path,
+                    )
+                });
+
+            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+
+            if let (Some(positions), Some(normals), Some(tex_coords)) = (
+                reader.read_positions(),
+                reader.read_normals(),
+                reader.read_tex_coords(0),
+            ) {
+                let mut vertices = Vec::new();
+
+                let indicies = reader
+                    .read_indices()
+                    .map(|indicies| indicies.into_u32().collect::<Vec<_>>())
+                    .unwrap_or_else(|| (0..positions.len() as u32).collect());
+
+                let positions: Vec<_> = positions.collect();
+                let normals: Vec<_> = normals.collect();
+                let tex_coords: Vec<_> = tex_coords.into_f32().collect();
+
+                for &index in indicies.iter() {
+                    let i = index as usize;
+                    let vertex = Vertex {
+                        position: Vec3::new(positions[i][0], positions[i][1], positions[i][2]),
+                        normal: Vec3::new(normals[i][0], normals[i][1], normals[i][2]),
+                        tex_coords: Vec2::new(tex_coords[i][0], tex_coords[i][1]),
+                    };
+                    vertices.push(vertex);
+                }
+
+                let (vertex_buffer, vertex_buffer_allocation) =
+                    create_vertex_buffer(device, allocator.clone(), command_pool, queue, &vertices);
+
+                meshes.push(Mesh {
+                    vertex_buffer,
+                    vertex_buffer_allocation: Some(vertex_buffer_allocation),
+                    vertex_count: vertices.len() as u32,
+                    transform: world_transform,
+                    texture,
+                });
+            }
+        }
+    }
+
+    for child in node.children() {
+        meshes.extend(process_node(
+            child,
+            world_transform,
+            buffers,
+            device,
+            allocator.clone(),
+            command_pool,
+            queue,
+            path,
+        ));
+    }
+
+    meshes
+}
+
+fn create_vertex_buffer(
+    device: &Device,
+    allocator: Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    vertices: &[Vertex],
+) -> (Buffer, Allocation) {
+    let mut allocator = allocator.lock().unwrap();
+
+    let vertex_buffer_size = std::mem::size_of_val(vertices) as u64;
+
+    let staging_buffer = unsafe {
+        device
+            .create_buffer(
+                &vk::BufferCreateInfo::builder()
+                    .size(vertex_buffer_size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC),
+                None,
+            )
+            .expect("failed to create buffer")
+    };
+
+    let staging_allocation = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "Staging vertex buffer",
+            requirements: unsafe { device.get_buffer_memory_requirements(staging_buffer) },
+            location: gpu_allocator::MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+        })
+        .expect("failed to allocate memory");
+
+    unsafe {
+        device
+            .bind_buffer_memory(
+                staging_buffer,
+                staging_allocation.memory(),
+                staging_allocation.offset(),
+            )
+            .expect("failed to bind buffer memory");
+
+        let ptr = staging_allocation.mapped_ptr().unwrap().as_ptr() as *mut Vertex;
+        ptr.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
+    }
+
+    let vertex_buffer = unsafe {
+        device
+            .create_buffer(
+                &vk::BufferCreateInfo::builder()
+                    .size(vertex_buffer_size)
+                    .usage(
+                        vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
+                    ),
+                None,
+            )
+            .expect("failed to create buffer")
+    };
+
+    let vertex_allocation = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "Vertex Buffer",
+            requirements: unsafe { device.get_buffer_memory_requirements(vertex_buffer) },
+            location: gpu_allocator::MemoryLocation::GpuOnly,
+            linear: true,
+            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+        })
+        .expect("failed to allocate memory");
+
+    unsafe {
+        device
+            .bind_buffer_memory(
+                vertex_buffer,
+                vertex_allocation.memory(),
+                vertex_allocation.offset(),
+            )
+            .expect("failed to bind buffer memory");
+    }
+
+    let command_buffer = unsafe {
+        device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::builder()
+                    .command_pool(command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .expect("failed to allocate command buffer")[0]
+    };
+
+    unsafe {
+        device
+            .begin_command_buffer(
+                command_buffer,
+                &vk::CommandBufferBeginInfo::builder()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+                    .build(),
+            )
+            .expect("failed to begin command_buffer");
+
+        device.cmd_copy_buffer(
+            command_buffer,
+            staging_buffer,
+            vertex_buffer,
+            &[vk::BufferCopy::builder().size(vertex_buffer_size).build()],
+        );
+
+        device
+            .end_command_buffer(command_buffer)
+            .expect("Failed to end command buffer");
+
+        device
+            .queue_submit(
+                queue,
+                &[vk::SubmitInfo::builder()
+                    .command_buffers(&[command_buffer])
+                    .build()],
+                vk::Fence::null(),
+            )
+            .expect("failed to submit queue");
+
+        device.queue_wait_idle(queue).expect("failed to wait queue");
+        device.free_command_buffers(command_pool, &[command_buffer]);
+    }
+
+    unsafe {
+        device.destroy_buffer(staging_buffer, None);
+    }
+    allocator
+        .free(staging_allocation)
+        .expect("failed to free memory");
+
+    (vertex_buffer, vertex_allocation)
 }
 
 pub struct RendererInner {
@@ -90,9 +688,9 @@ pub struct RendererInner {
     depth_image_views: Vec<vk::ImageView>,
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
-    vertex_buffer: Buffer,
-    vertex_buffer_allocation: Option<Allocation>,
-    vertex_count: u32,
+
+    model: Model,
+
     command_buffers: Vec<vk::CommandBuffer>,
     in_flight_fences: Vec<vk::Fence>,
     image_available_semaphores: Vec<vk::Semaphore>,
@@ -541,7 +1139,7 @@ impl RendererInner {
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
-            .front_face(vk::FrontFace::CLOCKWISE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .depth_bias_enable(false)
             .line_width(1.0);
         let stencil_op = vk::StencilOpState::builder()
@@ -601,178 +1199,6 @@ impl RendererInner {
         }
 
         (graphics_pipeline, pipeline_layout)
-    }
-
-    fn load_model_and_create_vertex_buffer(
-        device: &Device,
-        allocator: Arc<Mutex<Allocator>>,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-    ) -> (Buffer, Allocation, u32) {
-        let mut allocator = allocator.lock().unwrap();
-        let vertices = {
-            let model_obj = tobj::load_obj(
-                "./assets/suzanne.obj",
-                &tobj::LoadOptions {
-                    single_index: true,
-                    triangulate: true,
-                    ignore_points: true,
-                    ignore_lines: true,
-                },
-            )
-            .expect("Failed to load model");
-            let mut vertices = vec![];
-            let (models, _) = model_obj;
-            for m in models.iter() {
-                let mesh = &m.mesh;
-
-                for &i in mesh.indices.iter() {
-                    let i = i as usize;
-                    let vertex = Vertex {
-                        position: Vec3::new(
-                            mesh.positions[3 * i],
-                            mesh.positions[3 * i + 1],
-                            mesh.positions[3 * i + 2],
-                        ),
-                        normal: Vec3::new(
-                            mesh.normals[3 * i],
-                            mesh.normals[3 * i + 1],
-                            mesh.normals[3 * i + 2],
-                        ),
-                    };
-                    vertices.push(vertex);
-                }
-            }
-
-            vertices
-        };
-        let vertex_buffer_size = vertices.len() as u64 * std::mem::size_of::<Vertex>() as u64;
-        let temporary_buffer = unsafe {
-            device
-                .create_buffer(
-                    &vk::BufferCreateInfo::builder()
-                        .size(vertex_buffer_size)
-                        .usage(vk::BufferUsageFlags::TRANSFER_SRC),
-                    None,
-                )
-                .expect("Failed to create buffer")
-        };
-        let temporary_buffer_memory_requirements =
-            unsafe { device.get_buffer_memory_requirements(temporary_buffer) };
-        let temporary_buffer_allocation = allocator
-            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                name: "Temporary Vertex Buffer",
-                requirements: temporary_buffer_memory_requirements,
-                location: gpu_allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-            })
-            .expect("Failed to allocate memory");
-        unsafe {
-            device
-                .bind_buffer_memory(
-                    temporary_buffer,
-                    temporary_buffer_allocation.memory(),
-                    temporary_buffer_allocation.offset(),
-                )
-                .expect("Failed to bind buffer memory")
-        }
-        unsafe {
-            let ptr = temporary_buffer_allocation.mapped_ptr().unwrap().as_ptr() as *mut Vertex;
-            ptr.copy_from_nonoverlapping(vertices.as_ptr(), vertices.len());
-        }
-
-        let vertex_buffer = unsafe {
-            device
-                .create_buffer(
-                    &vk::BufferCreateInfo::builder()
-                        .size(vertex_buffer_size)
-                        .usage(
-                            vk::BufferUsageFlags::TRANSFER_DST
-                                | vk::BufferUsageFlags::VERTEX_BUFFER,
-                        ),
-                    None,
-                )
-                .expect("Failed to create buffer")
-        };
-        let vertex_buffer_memory_requirements =
-            unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
-        let vertex_buffer_allocation = allocator
-            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                name: "Vertex Buffer",
-                requirements: vertex_buffer_memory_requirements,
-                location: gpu_allocator::MemoryLocation::GpuOnly,
-                linear: true,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-            })
-            .expect("Failed to allocate memory");
-        unsafe {
-            device
-                .bind_buffer_memory(
-                    vertex_buffer,
-                    vertex_buffer_allocation.memory(),
-                    vertex_buffer_allocation.offset(),
-                )
-                .expect("Failed to bind buffer memory")
-        }
-
-        let cmd = unsafe {
-            device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::builder()
-                        .command_pool(command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .expect("Failed to allocate command buffer")[0]
-        };
-
-        unsafe {
-            device
-                .begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::builder()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .expect("Failed to begin command buffer");
-            device.cmd_copy_buffer(
-                cmd,
-                temporary_buffer,
-                vertex_buffer,
-                &[vk::BufferCopy::builder()
-                    .src_offset(0)
-                    .dst_offset(0)
-                    .size(vertex_buffer_size)
-                    .build()],
-            );
-            device
-                .end_command_buffer(cmd)
-                .expect("Failed to end command buffer");
-
-            device
-                .queue_submit(
-                    queue,
-                    &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()],
-                    vk::Fence::null(),
-                )
-                .expect("Failed to submit queue");
-            device.queue_wait_idle(queue).expect("Failed to wait queue");
-
-            device.free_command_buffers(command_pool, &[cmd]);
-        }
-
-        allocator
-            .free(temporary_buffer_allocation)
-            .expect("Failed to free memory");
-        unsafe {
-            device.destroy_buffer(temporary_buffer, None);
-        }
-
-        (
-            vertex_buffer,
-            vertex_buffer_allocation,
-            vertices.len() as u32,
-        )
     }
 
     fn create_command_buffers(
@@ -1036,13 +1462,15 @@ impl RendererInner {
         );
         let (pipeline, pipeline_layout) =
             Self::create_graphics_pipeline(&device, &descriptor_set_layouts, render_pass);
-        let (vertex_buffer, vertex_buffer_allocation, vertex_count) =
-            Self::load_model_and_create_vertex_buffer(
-                &device,
-                allocator.clone(),
-                command_pool,
-                queue,
-            );
+        println!("loading model!");
+        let model = Model::load(
+            &device,
+            allocator.clone(),
+            command_pool,
+            queue,
+            "./sponza/NewSponza_Main_glTF_003.gltf",
+        );
+        println!("loaded!");
         let command_buffers =
             Self::create_command_buffers(&device, command_pool, swapchain_images.len());
         let (in_flight_fences, image_available_semaphores, render_finished_semaphores) =
@@ -1074,9 +1502,7 @@ impl RendererInner {
             depth_image_views,
             pipeline,
             pipeline_layout,
-            vertex_buffer,
-            vertex_buffer_allocation: Some(vertex_buffer_allocation),
-            vertex_count,
+            model,
             command_buffers,
             in_flight_fences,
             image_available_semaphores,
@@ -1144,22 +1570,6 @@ impl RendererInner {
             self.recreate_swapchain(width, height, &mut egui_cmd);
         }
 
-        // unsafe {
-        //     self.device
-        //         .wait_for_fences(
-        //             std::slice::from_ref(&self.in_flight_fences[self.current_frame]),
-        //             true,
-        //             u64::MAX,
-        //         )
-        //         .expect("failed to wait for fences");
-        //
-        //     self.device
-        //         .reset_fences(std::slice::from_ref(
-        //             &self.in_flight_fences[self.current_frame],
-        //         ))
-        //         .expect("failed to reset fences");
-        // }
-
         unsafe {
             puffin::profile_scope!("wait_for_fences");
             self.device.wait_for_fences(
@@ -1210,26 +1620,6 @@ impl RendererInner {
             )
         };
 
-        let ubo = UniformBufferObject {
-            model: Mat4::from_rotation_y(rotate_y.to_radians()),
-            view,
-            proj: Mat4::perspective_rh(
-                self.camera_fov.to_radians(),
-                width as f32 / height as f32,
-                0.1,
-                10.0,
-            ),
-            model_color: self.model_color,
-        };
-
-        unsafe {
-            let ptr = self.uniform_buffer_allocations[self.current_frame]
-                .mapped_ptr()
-                .unwrap()
-                .as_ptr() as *mut UniformBufferObject;
-            ptr.copy_from_nonoverlapping([ubo].as_ptr(), 1);
-        }
-
         let command_buffer_begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
@@ -1272,6 +1662,7 @@ impl RendererInner {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline,
             );
+
             self.device.cmd_set_viewport(
                 self.command_buffers[self.current_frame],
                 0,
@@ -1292,28 +1683,51 @@ impl RendererInner {
                         .extent(self.surface_extent),
                 ),
             );
-            self.device.cmd_bind_descriptor_sets(
-                self.command_buffers[self.current_frame],
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0,
-                &[self.descriptor_sets[self.current_frame]],
-                &[],
-            );
 
-            self.device.cmd_bind_vertex_buffers(
-                self.command_buffers[self.current_frame],
-                0,
-                &[self.vertex_buffer],
-                &[0],
-            );
-            self.device.cmd_draw(
-                self.command_buffers[self.current_frame],
-                self.vertex_count,
-                1,
-                0,
-                0,
-            );
+            for mesh in &self.model.meshes {
+                let model_matrix = Mat4::from_rotation_y(rotate_y.to_radians()) * mesh.transform;
+
+                let ubo = UniformBufferObject {
+                    model: model_matrix,
+                    view,
+                    proj: Mat4::perspective_rh(
+                        self.camera_fov.to_radians(),
+                        width as f32 / height as f32,
+                        0.1,
+                        1000.0,
+                    ),
+                    model_color: self.model_color,
+                };
+
+                let ptr = self.uniform_buffer_allocations[self.current_frame]
+                    .mapped_ptr()
+                    .unwrap()
+                    .as_ptr() as *mut UniformBufferObject;
+                ptr.copy_from_nonoverlapping(&ubo, 1);
+
+                self.device.cmd_bind_descriptor_sets(
+                    self.command_buffers[self.current_frame],
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_layout,
+                    0,
+                    &[self.descriptor_sets[self.current_frame]],
+                    &[],
+                );
+
+                self.device.cmd_bind_vertex_buffers(
+                    self.command_buffers[self.current_frame],
+                    0,
+                    &[mesh.vertex_buffer],
+                    &[0],
+                );
+                self.device.cmd_draw(
+                    self.command_buffers[self.current_frame],
+                    mesh.vertex_count,
+                    1,
+                    0,
+                    0,
+                );
+            }
 
             self.device
                 .cmd_end_render_pass(self.command_buffers[self.current_frame]);
@@ -1393,11 +1807,13 @@ impl RendererInner {
             for semaphore in self.render_finished_semaphores.drain(..) {
                 self.device.destroy_semaphore(semaphore, None);
             }
-            self.device.destroy_buffer(self.vertex_buffer, None);
-            if let Some(vertex_buffer_allocation) = self.vertex_buffer_allocation.take() {
-                allocator
-                    .free(vertex_buffer_allocation)
-                    .expect("Failed to free memory");
+            for mesh in &mut self.model.meshes {
+                self.device.destroy_buffer(mesh.vertex_buffer, None);
+                if let Some(vertex_buffer_allocation) = mesh.vertex_buffer_allocation.take() {
+                    allocator
+                        .free(vertex_buffer_allocation)
+                        .expect("Failed to free memory");
+                }
             }
             self.device.destroy_pipeline(self.pipeline, None);
             self.device

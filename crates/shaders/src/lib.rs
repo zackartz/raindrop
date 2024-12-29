@@ -1,7 +1,7 @@
 #![cfg_attr(target_arch = "spirv", no_std)]
 
 use shaders_shared::UniformBufferObject;
-use spirv_std::spirv;
+use spirv_std::{glam::Vec2, image::Image2d, spirv, Image, Sampler};
 
 use glam::{Mat3, Vec3, Vec4, Vec4Swizzles};
 
@@ -35,10 +35,13 @@ pub fn main_vs(
 pub fn main_fs(
     frag_world_position: Vec3,
     frag_world_normal: Vec3,
-    out_color: &mut Vec4,
+    frag_tex_coord: Vec2,
     #[spirv(uniform, descriptor_set = 0, binding = 0)] ubo: &UniformBufferObject,
+    #[spirv(descriptor_set = 0, binding = 1)] texture: &Image2d,
+    #[spirv(descriptor_set = 0, binding = 2)] sampler: &Sampler,
+    out_color: &mut Vec4,
 ) {
-    let base_color = ubo.model_color;
+    let base_color = texture.sample(*sampler, frag_tex_coord);
     let light_pos = Vec3::new(2.0, 2.0, -2.0);
 
     // Calculate light direction
@@ -49,9 +52,13 @@ pub fn main_fs(
     let lambertian = f32::max(n.dot(l), 0.0);
 
     // Ambient lighting
-    let ambient = Vec3::splat(0.1);
+    let ambient = Vec3::splat(0.2);
+
+    // Combine texture color with model color
+    let color_from_texture = Vec3::new(base_color.x, base_color.y, base_color.z);
+    let combined_color = color_from_texture * ubo.model_color;
 
     // Final color calculation with gamma correction
-    let color = (base_color * lambertian + ambient).powf(2.2);
+    let color = (combined_color * lambertian + ambient).powf(2.2);
     *out_color = Vec4::from((color, 1.0));
 }

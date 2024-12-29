@@ -16,8 +16,10 @@ egui-ash = { version = "0.4.0", features = ["gpu-allocator"] }
 tobj = "4.0.2"
 egui = "0.25.0"
 ash-window = "0.12.0"
-
 shaders-shared = { path = "../shaders-shared" }
+puffin = { git = "https://github.com/EmbarkStudios/puffin", rev = "5ac4e54164ee89bd68c29f288c2b5613afc2c929" }
+puffin_egui = { git = "https://github.com/EmbarkStudios/puffin", rev = "5ac4e54164ee89bd68c29f288c2b5613afc2c929" }
+gpu-profiler = { path = "../../../gpu-profiler", features = ["use-ash"] }
 
 [build-dependencies]
 spirv-builder.workspace = true

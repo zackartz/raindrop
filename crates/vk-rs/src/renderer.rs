@@ -181,7 +181,7 @@ impl RendererInner {
             .queue_family_indices(&queue_family_indices)
             .pre_transform(surface_capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::FIFO)
+            .present_mode(vk::PresentModeKHR::MAILBOX)
             .clipped(true);
 
         let swapchain = unsafe {
@@ -607,7 +607,7 @@ impl RendererInner {
         let mut allocator = allocator.lock().unwrap();
         let vertices = {
             let model_obj = tobj::load_obj(
-                "./crates/vk-rs/assets/suzanne.obj",
+                "./assets/suzanne.obj",
                 &tobj::LoadOptions {
                     single_index: true,
                     triangulate: true,
@@ -1099,6 +1099,7 @@ impl RendererInner {
     }
 
     pub fn render(&mut self, width: u32, height: u32, mut egui_cmd: EguiCommand, rotate_y: f32) {
+        puffin::profile_function!();
         if width == 0 || height == 0 {
             return;
         }
@@ -1113,10 +1114,12 @@ impl RendererInner {
             || height != self.height
             || egui_cmd.swapchain_recreate_required()
         {
+            puffin::profile_scope!("recreate_swapchain");
             self.recreate_swapchain(width, height, &mut egui_cmd);
         }
 
         let result = unsafe {
+            puffin::profile_scope!("acquire_next_image");
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
@@ -1134,6 +1137,7 @@ impl RendererInner {
         };
 
         unsafe {
+            puffin::profile_scope!("wait_for_fences");
             self.device.wait_for_fences(
                 std::slice::from_ref(&self.in_flight_fences[self.current_frame]),
                 true,
@@ -1150,6 +1154,7 @@ impl RendererInner {
         .expect("Failed to reset fences");
 
         let view = {
+            puffin::profile_scope!("calculate_view");
             let (sin_pitch, cos_pitch) = self.camera_pitch.sin_cos();
             let (sin_yaw, cos_yaw) = self.camera_yaw.sin_cos();
 
@@ -1185,6 +1190,7 @@ impl RendererInner {
         let command_buffer_begin_info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
+            puffin::profile_scope!("render");
             self.device
                 .begin_command_buffer(
                     self.command_buffers[self.current_frame],
@@ -1287,6 +1293,7 @@ impl RendererInner {
                 &self.render_finished_semaphores[self.current_frame],
             ));
         unsafe {
+            puffin::profile_scope!("queue_submit");
             self.device
                 .queue_submit(
                     self.queue,

@@ -51,10 +51,13 @@ struct Game {
     last_fps_update: std::time::Instant,
     frame_count_since_last_update: i32,
     current_fps: f32,
+
+    show_profiler: bool,
 }
 
 impl App for Game {
     fn ui(&mut self, ctx: &egui::Context) {
+        puffin::GlobalProfiler::lock().new_frame();
         let now = std::time::Instant::now();
         self.frame_count_since_last_update += 1;
 
@@ -63,6 +66,10 @@ impl App for Game {
                 / now.duration_since(self.last_fps_update).as_secs_f32();
             self.frame_count_since_last_update = 0;
             self.last_fps_update = now;
+        }
+
+        if self.show_profiler {
+            puffin_egui::profiler_window(ctx);
         }
 
         egui::SidePanel::left("my_side_panel").show(ctx, |ui| {
@@ -97,6 +104,10 @@ impl App for Game {
                 ui.label("Z:");
                 ui.add(egui::DragValue::new(&mut self.camera_position.z).speed(0.1));
             });
+            ui.separator();
+            if ui.button("Show Profiler").clicked() {
+                self.show_profiler = !self.show_profiler;
+            }
             ui.label(format!("FPS: {:.1}", self.current_fps));
         });
 
@@ -168,6 +179,7 @@ impl App for Game {
     }
 
     fn request_redraw(&mut self, _viewport_id: egui::ViewportId) -> HandleRedraw {
+        puffin::profile_function!();
         HandleRedraw::Handle(Box::new({
             let renderer = self.renderer.clone();
             let rotate_y = self.rotate_y;
@@ -333,10 +345,15 @@ impl MyAppCreator {
         surface_loader: &Surface,
         surface: vk::SurfaceKHR,
         required_device_extensions: &[CString],
-    ) -> (vk::PhysicalDevice, vk::PhysicalDeviceMemoryProperties, u32) {
+    ) -> (
+        vk::PhysicalDevice,
+        vk::PhysicalDeviceProperties,
+        vk::PhysicalDeviceMemoryProperties,
+        u32,
+    ) {
         let mut queue_family_index: Option<usize> = None;
 
-        let (physical_device, physical_device_memory_properties) = {
+        let (physical_device, phsyical_device_properties, physical_device_memory_properties) = {
             let physical_devices = unsafe {
                 instance
                     .enumerate_physical_devices()
@@ -414,11 +431,19 @@ impl MyAppCreator {
             let physical_device_memory_properties =
                 unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-            (physical_device, physical_device_memory_properties)
+            let physical_device_properties =
+                unsafe { instance.get_physical_device_properties(physical_device) };
+
+            (
+                physical_device,
+                physical_device_properties,
+                physical_device_memory_properties,
+            )
         };
 
         (
             physical_device,
+            phsyical_device_properties,
             physical_device_memory_properties,
             queue_family_index.unwrap() as u32,
         )
@@ -494,8 +519,12 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
         for ext in &cc.required_device_extensions {
             req_ext.push(ext.to_owned());
         }
-        let (physical_device, _physical_device_memory_properties, queue_family_index) =
-            Self::create_physical_device(&instance, &surface_loader, surface, &req_ext);
+        let (
+            physical_device,
+            physical_device_properties,
+            _physical_device_memory_properties,
+            queue_family_index,
+        ) = Self::create_physical_device(&instance, &surface_loader, surface, &req_ext);
         let (device, queue) = Self::create_device(
             &instance,
             physical_device,
@@ -535,6 +564,8 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
             queue,
             command_pool,
             allocator: ManuallyDrop::new(allocator.clone()),
+
+            show_profiler: false,
 
             renderer: Renderer::new(
                 physical_device,
@@ -584,6 +615,8 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
 }
 
 fn main() -> std::process::ExitCode {
+    puffin::set_scopes_on(true);
+
     egui_ash::run(
         "vulkan",
         MyAppCreator,

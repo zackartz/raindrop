@@ -90,47 +90,30 @@ pub fn main_fs(
     frag_world_position: Vec3,
     frag_world_normal: Vec3,
     frag_tex_coord: Vec2,
-
-    #[spirv(uniform, descriptor_set = 0, binding = 0)] ubo: &UniformBufferObject,
     #[spirv(descriptor_set = 0, binding = 1)] texture: &Image2d,
     #[spirv(descriptor_set = 0, binding = 2)] sampler: &Sampler,
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] vertices: &[Vec4],
-
     out_color: &mut Vec4,
 ) {
-    let ray_origin = ubo.view.inverse().col(3).xyz();
-    let ray_direction = (frag_world_position - ray_origin).normalize();
-
-    let mut closest_t = f32::MAX;
-    let mut closest_normal = Vec3::ZERO;
-    let mut hit = false;
-    let num_vertices = vertices.len() as u32;
-    for i in (0..num_vertices).step_by(3_usize) {
-        if i + 2 >= num_vertices {
-            break;
-        }
-        let v0 = vertices[i as usize].xyz();
-        let v1 = vertices[(i + 1) as usize].xyz();
-        let v2 = vertices[(i + 2) as usize].xyz();
-
-        let t = ray_triangle_intersect(ray_origin, ray_direction, v0, v1, v2);
-        if t > 0.0 && t < closest_t {
-            hit = true;
-            closest_t = t;
-            let normal = (v1 - v0).cross(v2 - v0).normalize();
-            closest_normal = normal;
-        }
-    }
-
-    let final_color = if hit {
-        let intersection_point = ray_origin + ray_direction * closest_t;
-        let light_pos = Vec3::new(2.0, 2.0, -2.0);
-        let object_color = Vec3::new(1.0, 0.8, 0.4);
-        material_color(intersection_point, closest_normal, light_pos, object_color)
-    } else {
-        let sampled = texture.sample(*sampler, frag_tex_coord);
-        Vec3::new(sampled.x, sampled.y, sampled.z)
-    };
-
-    *out_color = Vec4::new(final_color.x, final_color.y, final_color.z, 1.0);
+    // Convert fragment coordinate to UV coordinate
+    // Sample the texture
+    let base_color = texture.sample(*sampler, frag_tex_coord);
+    // let light_pos = Vec3::new(2.0, 2.0, -2.0);
+    //
+    // // Calculate light direction
+    // let l = (light_pos - frag_world_position).normalize();
+    // let n = frag_world_normal.normalize();
+    //
+    // // Calculate lambertian lighting
+    // let lambertian = f32::max(n.dot(l), 0.0);
+    //
+    // // Ambient lighting
+    // let ambient = Vec3::splat(0.2);
+    //
+    // // Combine texture color with model color
+    // let color_from_texture = Vec3::new(base_color.x, base_color.y, base_color.z);
+    // let combined_color = color_from_texture;
+    //
+    // // Final color calculation with gamma correction
+    // let color = (combined_color * lambertian + ambient).powf(2.2);
+    *out_color = Vec4::new(base_color.x, base_color.y, base_color.z, base_color.w);
 }

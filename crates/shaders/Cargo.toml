@@ -8,6 +8,5 @@ crate-type = ["dylib"]
 
 [dependencies]
 spirv-std.workspace = true
-glam.workspace = true
 
 shaders-shared = { path = "../shaders-shared" }

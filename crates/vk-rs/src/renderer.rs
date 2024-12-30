@@ -1,20 +1,22 @@
 use ash::{
     extensions::khr::{Surface, Swapchain},
-    vk::{self, Buffer, ImageAspectFlags},
+    vk::{self, Buffer},
     Device,
 };
 use egui::Vec2;
 use egui_ash::EguiCommand;
-use glam::{Mat4, Vec3};
-use gltf::json::buffer::View;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator};
-use shaders_shared::UniformBufferObject;
+use shaders_shared::{PushConstants, UniformBufferObject};
+use spirv_std::glam::{Mat4, Vec3, Vec4};
 use std::{
     ffi::CString,
     mem::ManuallyDrop,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
+    time::Instant,
 };
+
+use crate::texture_cache::TextureCache;
 
 macro_rules! include_spirv {
     ($file:literal) => {{
@@ -91,6 +93,8 @@ impl Texture {
         let mut allocator = allocator.lock().unwrap();
 
         let buffer_size = data.len() as u64;
+
+        println!("DATA LEN: {}", buffer_size);
         let staging_buffer = unsafe {
             device
                 .create_buffer(
@@ -163,7 +167,7 @@ impl Texture {
                 .expect("failed to bind image memory")
         };
 
-        let command_buffer = unsafe {
+        unsafe {
             let command_buffer = device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::builder()
@@ -218,7 +222,10 @@ impl Texture {
                     width,
                     height,
                     depth: 1,
-                });
+                })
+                .buffer_offset(0)
+                .buffer_row_length(width)
+                .buffer_image_height(height);
 
             device.cmd_copy_buffer_to_image(
                 command_buffer,
@@ -329,7 +336,7 @@ impl Texture {
         }
     }
 
-    fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
+    pub fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
         unsafe {
             device.destroy_sampler(self.sampler, None);
             device.destroy_image_view(self.image_view, None);
@@ -346,11 +353,29 @@ pub struct Mesh {
     vertex_buffer_allocation: Option<Allocation>,
     vertex_count: u32,
     transform: Mat4,
-    texture: Option<Texture>,
+    texture: Option<Arc<Texture>>,
+    descriptor_sets: Vec<vk::DescriptorSet>,
 }
 
 pub struct Model {
     meshes: Vec<Mesh>,
+    texture_cache: TextureCache,
+}
+
+impl Model {
+    fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
+        for mesh in &mut self.meshes {
+            unsafe {
+                device.destroy_buffer(mesh.vertex_buffer, None);
+                if let Some(vertex_buffer_allocation) = mesh.vertex_buffer_allocation.take() {
+                    allocator
+                        .free(vertex_buffer_allocation)
+                        .expect("Failed to free memory");
+                }
+                self.texture_cache.cleanup(device, allocator);
+            }
+        }
+    }
 }
 
 fn load_texture_from_gltf(
@@ -362,28 +387,27 @@ fn load_texture_from_gltf(
     buffers: &[gltf::buffer::Data],
     path: &Path,
 ) -> Option<Texture> {
-    let image = texture.source();
-    let data = match image.source() {
-        gltf::image::Source::View { view, .. } => {
-            // Handle embedded buffer view
-            match view.buffer().source() {
-                gltf::buffer::Source::Bin => {
-                    let start = view.offset();
-                    let end = start + view.length();
-                    buffers[0][start..end].to_vec()
-                }
-                _ => return None,
-            }
-        }
-        gltf::image::Source::Uri { .. } => {
-            // For URI sources, we'll get the data directly from gltf::image::Data
-            let img_data =
-                gltf::image::Data::from_source(image.source(), Some(path), buffers).ok()?;
-            img_data.pixels.clone().to_vec()
-        }
-    };
+    let img_data =
+        gltf::image::Data::from_source(texture.source().source(), Some(path), buffers).ok()?;
 
-    let img_data = gltf::image::Data::from_source(image.source(), Some(path), buffers).ok()?;
+    println!(
+        "Original texture dimensions: {}x{}",
+        img_data.width, img_data.height
+    );
+
+    // Convert to RGB/RGBA
+    let pixels_rgba = if img_data.pixels.len() == (img_data.width * img_data.height * 3) as usize {
+        // Image is RGB, convert to RGBA
+        println!("Converting RGB to RGBA");
+        let mut rgba_data = Vec::with_capacity((img_data.width * img_data.height * 4) as usize);
+        for chunk in img_data.pixels.chunks_exact(3) {
+            rgba_data.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+        }
+        rgba_data
+    } else {
+        // Assume it's already RGBA
+        img_data.pixels
+    };
 
     Some(Texture::new(
         device,
@@ -392,7 +416,7 @@ fn load_texture_from_gltf(
         queue,
         img_data.width,
         img_data.height,
-        &data,
+        &pixels_rgba,
     ))
 }
 
@@ -408,6 +432,7 @@ impl Model {
         let base_path = path.parent();
         let (document, buffers, _) = gltf::import(path).expect("failed to load GLTF");
         let mut meshes = Vec::new();
+        let mut texture_cache = TextureCache::new();
 
         for scene in document.scenes() {
             for node in scene.nodes() {
@@ -420,11 +445,15 @@ impl Model {
                     command_pool,
                     queue,
                     base_path.unwrap(),
+                    &mut texture_cache,
                 ));
             }
         }
 
-        Self { meshes }
+        Self {
+            meshes,
+            texture_cache,
+        }
     }
 }
 
@@ -437,6 +466,7 @@ fn process_node(
     command_pool: vk::CommandPool,
     queue: vk::Queue,
     path: &Path,
+    texture_cache: &mut TextureCache,
 ) -> Vec<Mesh> {
     let mut meshes = Vec::new();
 
@@ -444,7 +474,7 @@ fn process_node(
         let (translation, rotation, scale) = node.transform().decomposed();
         Mat4::from_scale_rotation_translation(
             Vec3::from(scale),
-            glam::Quat::from_array(rotation),
+            spirv_std::glam::Quat::from_array(rotation),
             Vec3::from(translation),
         )
     };
@@ -457,17 +487,22 @@ fn process_node(
                 .pbr_metallic_roughness()
                 .base_color_texture()
                 .and_then(|tex| {
-                    load_texture_from_gltf(
-                        device,
-                        allocator.clone(),
-                        command_pool,
-                        queue,
-                        &tex.texture(),
-                        buffers,
-                        path,
-                    )
+                    // Create a unique key for the texture
+                    let key = format!("{:?}", tex.texture().source().source());
+                    texture_cache.get_or_load_texture(key, || {
+                        load_texture_from_gltf(
+                            device,
+                            allocator.clone(),
+                            command_pool,
+                            queue,
+                            &tex.texture(),
+                            buffers,
+                            path,
+                        )
+                    })
                 });
 
+            // Rest of the mesh creation code...
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
 
             if let (Some(positions), Some(normals), Some(tex_coords)) = (
@@ -477,16 +512,16 @@ fn process_node(
             ) {
                 let mut vertices = Vec::new();
 
-                let indicies = reader
+                let indices = reader
                     .read_indices()
-                    .map(|indicies| indicies.into_u32().collect::<Vec<_>>())
+                    .map(|indices| indices.into_u32().collect::<Vec<_>>())
                     .unwrap_or_else(|| (0..positions.len() as u32).collect());
 
                 let positions: Vec<_> = positions.collect();
                 let normals: Vec<_> = normals.collect();
                 let tex_coords: Vec<_> = tex_coords.into_f32().collect();
 
-                for &index in indicies.iter() {
+                for &index in indices.iter() {
                     let i = index as usize;
                     let vertex = Vertex {
                         position: Vec3::new(positions[i][0], positions[i][1], positions[i][2]),
@@ -505,6 +540,7 @@ fn process_node(
                     vertex_count: vertices.len() as u32,
                     transform: world_transform,
                     texture,
+                    descriptor_sets: Vec::new(),
                 });
             }
         }
@@ -520,6 +556,7 @@ fn process_node(
             command_pool,
             queue,
             path,
+            texture_cache,
         ));
     }
 
@@ -680,7 +717,6 @@ pub struct RendererInner {
     uniform_buffer_allocations: Vec<Allocation>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
-    descriptor_sets: Vec<vk::DescriptorSet>,
     render_pass: vk::RenderPass,
     framebuffers: Vec<vk::Framebuffer>,
     depth_images_and_allocations: Vec<(vk::Image, Allocation)>,
@@ -849,17 +885,26 @@ impl RendererInner {
         (buffers, buffer_allocations)
     }
 
-    fn create_descriptor_pool(device: &Device, swapchain_count: usize) -> vk::DescriptorPool {
-        let pool_size = vk::DescriptorPoolSize::builder()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(swapchain_count as u32);
+    fn create_descriptor_pool(device: &Device, total_sets_needed: usize) -> vk::DescriptorPool {
+        let pool_sizes = [
+            vk::DescriptorPoolSize::builder()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(total_sets_needed as u32)
+                .build(),
+            vk::DescriptorPoolSize::builder()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(total_sets_needed as u32)
+                .build(),
+        ];
+
         let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo::builder()
-            .pool_sizes(std::slice::from_ref(&pool_size))
-            .max_sets(swapchain_count as u32);
+            .pool_sizes(&pool_sizes)
+            .max_sets(total_sets_needed as u32);
+
         unsafe {
             device
                 .create_descriptor_pool(&descriptor_pool_create_info, None)
-                .expect("Failed to create descriptor pool")
+                .expect("failed to create descriptor pool")
         }
     }
 
@@ -867,18 +912,35 @@ impl RendererInner {
         device: &Device,
         swapchain_count: usize,
     ) -> Vec<vk::DescriptorSetLayout> {
-        let ubo_layout_binding = vk::DescriptorSetLayoutBinding::builder()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT);
-        let ubo_layout_create_info = vk::DescriptorSetLayoutCreateInfo::builder()
-            .bindings(std::slice::from_ref(&ubo_layout_binding));
+        let bindings = [
+            // Binding 0: Uniform buffer
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            // Binding 1: Texture sampler
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+        ];
+
+        let layout_create_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
 
         (0..swapchain_count)
             .map(|_| unsafe {
                 device
-                    .create_descriptor_set_layout(&ubo_layout_create_info, None)
+                    .create_descriptor_set_layout(&layout_create_info, None)
                     .expect("Failed to create descriptor set layout")
             })
             .collect()
@@ -889,28 +951,65 @@ impl RendererInner {
         descriptor_pool: vk::DescriptorPool,
         descriptor_set_layouts: &[vk::DescriptorSetLayout],
         uniform_buffers: &[Buffer],
+        mesh: &Mesh,
     ) -> Vec<vk::DescriptorSet> {
-        let descriptor_set_allocate_info = vk::DescriptorSetAllocateInfo::builder()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(descriptor_set_layouts);
         let descriptor_sets = unsafe {
             device
-                .allocate_descriptor_sets(&descriptor_set_allocate_info)
-                .expect("Failed to allocate descriptor sets")
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::builder()
+                        .descriptor_pool(descriptor_pool)
+                        .set_layouts(descriptor_set_layouts),
+                )
+                .expect("failed to allocate descriptor sets")
         };
-        for index in 0..descriptor_sets.len() {
+
+        for (index, &descriptor_set) in descriptor_sets.iter().enumerate() {
             let buffer_info = vk::DescriptorBufferInfo::builder()
                 .buffer(uniform_buffers[index])
                 .offset(0)
                 .range(vk::WHOLE_SIZE)
                 .build();
-            let descriptor_write = vk::WriteDescriptorSet::builder()
-                .dst_set(descriptor_sets[index])
+
+            let mut descriptor_writes = vec![vk::WriteDescriptorSet::builder()
+                .dst_set(descriptor_set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(std::slice::from_ref(&buffer_info));
+                .buffer_info(std::slice::from_ref(&buffer_info))
+                .build()];
+
+            if let Some(ref texture) = mesh.texture {
+                // Image view descriptor
+                let image_info = vk::DescriptorImageInfo::builder()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(texture.image_view)
+                    .build();
+
+                descriptor_writes.push(
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(descriptor_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(std::slice::from_ref(&image_info))
+                        .build(),
+                );
+
+                // Sampler descriptor
+                let sampler_info = vk::DescriptorImageInfo::builder()
+                    .sampler(texture.sampler)
+                    .build();
+
+                descriptor_writes.push(
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(descriptor_set)
+                        .dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(std::slice::from_ref(&sampler_info))
+                        .build(),
+                );
+            }
+
             unsafe {
-                device.update_descriptor_sets(std::slice::from_ref(&descriptor_write), &[]);
+                device.update_descriptor_sets(&descriptor_writes, &[]);
             }
         }
 
@@ -1119,10 +1218,19 @@ impl RendererInner {
                 .name(&main_function_name_fs)
                 .build(),
         ];
+
+        let push_constant_range = vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<PushConstants>() as u32)
+            .build();
+
         let pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::builder().set_layouts(descriptor_set_layouts),
+                    &vk::PipelineLayoutCreateInfo::builder()
+                        .set_layouts(descriptor_set_layouts)
+                        .push_constant_ranges(&[push_constant_range]),
                     None,
                 )
                 .expect("Failed to create pipeline layout")
@@ -1139,7 +1247,7 @@ impl RendererInner {
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
-            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .front_face(vk::FrontFace::CLOCKWISE)
             .depth_bias_enable(false)
             .line_width(1.0);
         let stencil_op = vk::StencilOpState::builder()
@@ -1437,15 +1545,26 @@ impl RendererInner {
                 swapchain_images.len(),
             );
 
-        let descriptor_pool = Self::create_descriptor_pool(&device, swapchain_images.len());
+        let t = Instant::now();
+        println!("loading model!");
+        let mut model = Model::load(
+            &device,
+            allocator.clone(),
+            command_pool,
+            queue,
+            "./sponza/NewSponza_Main_glTF_003.gltf",
+        );
+        println!(
+            "loaded {} meshes in {:.2} seconds!",
+            model.meshes.len(),
+            t.elapsed().as_secs_f32()
+        );
+
+        let descriptor_pool =
+            Self::create_descriptor_pool(&device, model.meshes.len() * swapchain_images.len());
         let descriptor_set_layouts =
             Self::create_descriptor_set_layouts(&device, swapchain_images.len());
-        let descriptor_sets = Self::create_descriptor_sets(
-            &device,
-            descriptor_pool,
-            &descriptor_set_layouts,
-            &uniform_buffers,
-        );
+
         let render_pass = Self::create_render_pass(&device, surface_format);
         let CreateFramebuffersResult(
             framebuffers,
@@ -1462,19 +1581,20 @@ impl RendererInner {
         );
         let (pipeline, pipeline_layout) =
             Self::create_graphics_pipeline(&device, &descriptor_set_layouts, render_pass);
-        println!("loading model!");
-        let model = Model::load(
-            &device,
-            allocator.clone(),
-            command_pool,
-            queue,
-            "./sponza/NewSponza_Main_glTF_003.gltf",
-        );
-        println!("loaded!");
         let command_buffers =
             Self::create_command_buffers(&device, command_pool, swapchain_images.len());
         let (in_flight_fences, image_available_semaphores, render_finished_semaphores) =
             Self::create_sync_objects(&device, swapchain_images.len());
+
+        for mesh in &mut model.meshes {
+            mesh.descriptor_sets = Self::create_descriptor_sets(
+                &device,
+                descriptor_pool,
+                &descriptor_set_layouts,
+                &uniform_buffers,
+                mesh,
+            );
+        }
 
         Self {
             width,
@@ -1494,7 +1614,6 @@ impl RendererInner {
             uniform_buffer_allocations,
             descriptor_pool,
             descriptor_set_layouts,
-            descriptor_sets,
             render_pass,
             framebuffers,
             depth_images_and_allocations,
@@ -1514,7 +1633,7 @@ impl RendererInner {
             camera_position: Vec3::new(0.0, 0.0, -5.0),
             camera_yaw: 0.,
             camera_pitch: 0.,
-            camera_fov: 45.,
+            camera_fov: 90.,
             bg_color: Vec3::splat(0.1),
             model_color: Vec3::splat(0.8),
             accumulation_reset_needed: true,
@@ -1685,6 +1804,18 @@ impl RendererInner {
             );
 
             for mesh in &self.model.meshes {
+                let push_constants = PushConstants {
+                    texture_size: Vec4::new(1024.0, 1024.0, 1.0 / 1024.0, 1.0 / 1024.0),
+                };
+                unsafe {
+                    self.device.cmd_push_constants(
+                        self.command_buffers[self.current_frame],
+                        self.pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        bytemuck::cast_slice(&[push_constants]),
+                    );
+                }
                 let model_matrix = Mat4::from_rotation_y(rotate_y.to_radians()) * mesh.transform;
 
                 let ubo = UniformBufferObject {
@@ -1710,7 +1841,7 @@ impl RendererInner {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
                     0,
-                    &[self.descriptor_sets[self.current_frame]],
+                    &[mesh.descriptor_sets[self.current_frame]],
                     &[],
                 );
 
@@ -1807,14 +1938,7 @@ impl RendererInner {
             for semaphore in self.render_finished_semaphores.drain(..) {
                 self.device.destroy_semaphore(semaphore, None);
             }
-            for mesh in &mut self.model.meshes {
-                self.device.destroy_buffer(mesh.vertex_buffer, None);
-                if let Some(vertex_buffer_allocation) = mesh.vertex_buffer_allocation.take() {
-                    allocator
-                        .free(vertex_buffer_allocation)
-                        .expect("Failed to free memory");
-                }
-            }
+            self.model.destroy(&self.device, &mut allocator);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);

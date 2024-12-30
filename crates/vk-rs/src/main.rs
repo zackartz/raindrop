@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    f32::consts::PI,
     ffi::CString,
     mem::ManuallyDrop,
     sync::{Arc, Mutex},
@@ -13,16 +14,16 @@ use ash::{
     vk::{self, KhrAccelerationStructureFn, KhrDeferredHostOperationsFn, KhrRayTracingPipelineFn},
     Device, Entry, Instance,
 };
-use egui::widgets;
 use egui_ash::{
     raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle},
     winit, App, AppCreator, AshRenderState, CreationContext, HandleRedraw, RunOption, Theme,
 };
-use glam::Vec3;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use renderer::Renderer;
+use spirv_std::glam::Vec3;
 
 mod renderer;
+mod texture_cache;
 
 struct Game {
     entry: Entry,
@@ -131,11 +132,10 @@ impl App for Game {
         if !ctx.wants_keyboard_input() {
             let movement_speed = 0.1;
 
-            // Calculate forward direction using yaw
             let forward = Vec3::new(
-                self.camera_yaw.sin(),
+                self.camera_yaw.sin() * self.camera_pitch.cos(),
                 self.camera_pitch.sin(),
-                self.camera_yaw.cos(),
+                self.camera_yaw.cos() * self.camera_pitch.cos(),
             )
             .normalize();
 
@@ -263,9 +263,13 @@ impl Drop for Game {
 
 struct MyAppCreator;
 impl MyAppCreator {
+    #[cfg(debug_assertions)]
     const ENABLE_VALIDATION_LAYERS: bool = true;
+    #[cfg(not(debug_assertions))]
+    const ENABLE_VALIDATION_LAYERS: bool = false;
     const VALIDATION: [&'static str; 1] = ["VK_LAYER_KHRONOS_validation"];
 
+    #[cfg(debug_assertions)]
     unsafe extern "system" fn vulkan_debug_utils_callback(
         message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
         message_types: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -288,6 +292,16 @@ impl MyAppCreator {
         let message = std::ffi::CStr::from_ptr((*p_callback_data).p_message);
         println!("[DEBUG]{}{}{:?}", severity, types, message);
 
+        vk::FALSE
+    }
+
+    #[cfg(not(debug_assertions))]
+    unsafe extern "system" fn vulkan_debug_utils_callback(
+        _message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+        _message_types: vk::DebugUtilsMessageTypeFlagsEXT,
+        _p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+        _p_user_data: *mut std::ffi::c_void,
+    ) -> vk::Bool32 {
         vk::FALSE
     }
 
@@ -639,7 +653,7 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
             camera_position: Vec3::new(0.0, 0.0, -5.0),
             camera_pitch: 0.,
             camera_yaw: 0.,
-            camera_fov: 45.,
+            camera_fov: 90.,
             bg_color: Vec3::splat(0.1).into(),
             model_color: Vec3::splat(0.8).into(),
             last_mouse_pos: None,

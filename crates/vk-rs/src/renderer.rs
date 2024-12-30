@@ -502,7 +502,6 @@ fn process_node(
                     })
                 });
 
-            // Rest of the mesh creation code...
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
 
             if let (Some(positions), Some(normals), Some(tex_coords)) = (
@@ -523,9 +522,21 @@ fn process_node(
 
                 for &index in indices.iter() {
                     let i = index as usize;
+                    // Apply world transform to position
+                    let position = world_transform.transform_point3(Vec3::new(
+                        positions[i][0],
+                        positions[i][1],
+                        positions[i][2],
+                    ));
+                    let normal = world_transform.transform_vector3(Vec3::new(
+                        normals[i][0],
+                        normals[i][1],
+                        normals[i][2],
+                    ));
+
                     let vertex = Vertex {
-                        position: Vec3::new(positions[i][0], positions[i][1], positions[i][2]),
-                        normal: Vec3::new(normals[i][0], normals[i][1], normals[i][2]),
+                        position,
+                        normal,
                         tex_coords: Vec2::new(tex_coords[i][0], tex_coords[i][1]),
                     };
                     vertices.push(vertex);
@@ -538,7 +549,8 @@ fn process_node(
                     vertex_buffer,
                     vertex_buffer_allocation: Some(vertex_buffer_allocation),
                     vertex_count: vertices.len() as u32,
-                    transform: world_transform,
+                    // Store identity matrix, it is not used here anymore
+                    transform: Mat4::IDENTITY,
                     texture,
                     descriptor_sets: Vec::new(),
                 });

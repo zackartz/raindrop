@@ -50,6 +50,7 @@ struct Game {
     camera_fov: f32,
     right_mouse_pressed: bool,
     last_mouse_pos: Option<(f32, f32)>,
+    mouse_sensitivity: f32,
 
     last_fps_update: std::time::Instant,
     frame_count_since_last_update: i32,
@@ -79,7 +80,6 @@ impl App for Game {
         }
 
         egui::SidePanel::left("my_side_panel").show(ctx, |ui| {
-            ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Theme");
                 let id = ui.make_persistent_id("theme_combo_box_side");
@@ -90,13 +90,17 @@ impl App for Game {
                         ui.selectable_value(&mut self.theme, Theme::Light, "Light");
                     });
             });
+
             ui.separator();
+
             ui.label("Rotate");
             ui.add(egui::widgets::Slider::new(
                 &mut self.rotate_y,
                 -180.0..=180.0,
             ));
+
             ui.separator();
+
             ui.label("Camera Position");
             ui.horizontal(|ui| {
                 ui.label("X:");
@@ -110,11 +114,21 @@ impl App for Game {
                 ui.label("Z:");
                 ui.add(egui::DragValue::new(&mut self.camera_position.z).speed(0.1));
             });
+
             ui.separator();
+
             ui.label("FOV");
             ui.add(egui::widgets::Slider::new(
                 &mut self.camera_fov,
                 10.0..=150.0,
+            ));
+
+            ui.separator();
+
+            ui.label("Mouse Sensitivity");
+            ui.add(egui::widgets::Slider::new(
+                &mut self.mouse_sensitivity,
+                0.05..=4.0,
             ));
             ui.separator();
 
@@ -169,13 +183,17 @@ impl App for Game {
         let hover_pos = ctx.input(|i| i.pointer.hover_pos());
 
         // Set cursor visibility based on right mouse button
-        if is_right_mouse_down != self.right_mouse_pressed {
-            if is_right_mouse_down {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
-            }
-        }
+        // if is_right_mouse_down != self.right_mouse_pressed {
+        //     if is_right_mouse_down {
+        //         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+        //         ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+        //             egui::CursorGrab::Confined,
+        //         ));
+        //     } else {
+        //         ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        //         ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+        //     }
+        // }
 
         self.right_mouse_pressed = is_right_mouse_down;
 
@@ -187,9 +205,9 @@ impl App for Game {
                         let delta_y = pos.y - last_y;
 
                         // Update camera rotation
-                        let rotation_speed = 0.002;
-                        self.camera_yaw -= delta_x * rotation_speed;
-                        self.camera_pitch = (self.camera_pitch + delta_y * rotation_speed)
+                        let rotation_speed = self.mouse_sensitivity / 100.0;
+                        self.camera_yaw += delta_x * rotation_speed;
+                        self.camera_pitch = (self.camera_pitch - delta_y * rotation_speed)
                             .clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
                     }
                     self.last_mouse_pos = Some((pos.x, pos.y));
@@ -649,6 +667,8 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
                 Theme::Light
             },
             rotate_y: 0.0,
+
+            mouse_sensitivity: 0.4,
 
             camera_position: Vec3::new(0.0, 0.0, -5.0),
             camera_pitch: 0.,

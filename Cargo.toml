@@ -1,12 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = [
-  "crates/rt-helper",
-  "crates/shaders",
-  "crates/shaders-shared",
-  "crates/vk-rs",
-]
+members = ["crates/rt-helper", "crates/shaders-shared", "crates/vk-rs"]
 
 [workspace.dependencies]
 ash = { version = "0.37.3" }

@@ -2465,14 +2465,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shaders"
-version = "0.1.0"
-dependencies = [
- "shaders-shared",
- "spirv-std",
-]
-
-[[package]]
 name = "shaders-shared"
 version = "0.1.0"
 dependencies = [

@@ -1,12 +1,12 @@
 use ash::{
     extensions::khr::{Surface, Swapchain},
-    vk::{self, Buffer},
+    vk::{self, Buffer, DescriptorType},
     Device,
 };
 use egui::Vec2;
 use egui_ash::EguiCommand;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, Allocator};
-use shaders_shared::{PushConstants, UniformBufferObject};
+use shaders_shared::{Material, PushConstants, UniformBufferObject};
 use spirv_std::glam::{Mat4, Vec3, Vec4};
 use std::{
     ffi::CString,
@@ -39,84 +39,6 @@ pub struct DefaultTextures {
     metallic_roughness: Texture, // Default metallic-roughness (black metallic, 0.5 roughness)
     normal: Texture,             // Default normal map (flat normal)
     sampler: vk::Sampler,        // Common sampler for all textures
-}
-
-pub struct Material {
-    base_color: Vec4,
-    metallic_factor: f32,
-    roughness_factor: f32,
-    base_color_texture: Option<Arc<Texture>>,
-    // metallic_roughness_texture: Option<Arc<Texture>>,
-    // normal_texture: Option<Arc<Texture>>,
-}
-
-impl Material {
-    fn from_gltf(
-        material: &gltf::Material,
-        device: &Device,
-        allocator: Arc<Mutex<Allocator>>,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-        path: &Path,
-        texture_cache: &mut TextureCache,
-        buffers: &[gltf::buffer::Data],
-    ) -> Self {
-        let pbr = material.pbr_metallic_roughness();
-
-        let base_color = pbr.base_color_factor();
-        let metallic_factor = pbr.metallic_factor();
-        let roughness_factor = pbr.roughness_factor();
-
-        let base_color_texture = pbr.base_color_texture().and_then(|tex| {
-            let key = format!("{:?}", tex.texture().source().source());
-            texture_cache.get_or_load_texture(key, || {
-                load_texture_from_gltf(
-                    device,
-                    allocator.clone(),
-                    command_pool,
-                    queue,
-                    &tex.texture(),
-                    buffers,
-                    path,
-                )
-            })
-        });
-
-        // let metallic_roughness_texture = pbr.metallic_roughness_texture().and_then(|tex| {
-        //     load_texture_from_gltf(
-        //         device,
-        //         allocator.clone(),
-        //         command_pool,
-        //         queue,
-        //         &tex.texture(),
-        //         buffers,
-        //         path,
-        //     )
-        //     .map(Arc::new)
-        // });
-        //
-        // let normal_texture = material.normal_texture().and_then(|tex| {
-        //     load_texture_from_gltf(
-        //         device,
-        //         allocator.clone(),
-        //         command_pool,
-        //         queue,
-        //         &tex.texture(),
-        //         buffers,
-        //         path,
-        //     )
-        //     .map(Arc::new)
-        // });
-
-        Self {
-            base_color: Vec4::from(base_color),
-            metallic_factor,
-            roughness_factor,
-            base_color_texture,
-            // metallic_roughness_texture,
-            // normal_texture,
-        }
-    }
 }
 
 #[repr(C)]
@@ -434,92 +356,17 @@ impl Texture {
     }
 }
 
-impl DefaultTextures {
-    fn new(
-        device: &Device,
-        allocator: Arc<Mutex<Allocator>>,
-        command_pool: vk::CommandPool,
-        queue: vk::Queue,
-    ) -> Self {
-        // Create a 1x1 white texture for default albedo
-        let white_data = vec![255u8, 255, 255, 255];
-        let white = Texture::new(
-            device,
-            allocator.clone(),
-            command_pool,
-            queue,
-            1,
-            1,
-            &white_data,
-        );
-
-        // Create a 1x1 default metallic-roughness texture
-        // R: unused, G: roughness (0.5), B: metallic (0.0)
-        let metallic_roughness_data = vec![0u8, 128, 0, 255];
-        let metallic_roughness = Texture::new(
-            device,
-            allocator.clone(),
-            command_pool,
-            queue,
-            1,
-            1,
-            &metallic_roughness_data,
-        );
-
-        // Create a 1x1 default normal map (pointing up)
-        let normal_data = vec![128u8, 128, 255, 255];
-        let normal = Texture::new(device, allocator, command_pool, queue, 1, 1, &normal_data);
-
-        // Create a common sampler
-        let sampler_create_info = vk::SamplerCreateInfo::builder()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::REPEAT)
-            .address_mode_v(vk::SamplerAddressMode::REPEAT)
-            .address_mode_w(vk::SamplerAddressMode::REPEAT)
-            .anisotropy_enable(true)
-            .max_anisotropy(16.0)
-            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
-            .unnormalized_coordinates(false)
-            .compare_enable(false)
-            .compare_op(vk::CompareOp::ALWAYS)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .mip_lod_bias(0.0)
-            .min_lod(0.0)
-            .max_lod(0.0);
-
-        let sampler = unsafe {
-            device
-                .create_sampler(&sampler_create_info, None)
-                .expect("Failed to create sampler")
-        };
-
-        Self {
-            white,
-            metallic_roughness,
-            normal,
-            sampler,
-        }
-    }
-
-    fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
-        unsafe {
-            self.white.destroy(device, allocator);
-            self.metallic_roughness.destroy(device, allocator);
-            self.normal.destroy(device, allocator);
-            device.destroy_sampler(self.sampler, None);
-        }
-    }
-}
-
 pub struct Mesh {
     vertex_buffer: Buffer,
     vertex_buffer_allocation: Option<Allocation>,
     vertex_count: u32,
     transform: Mat4,
-    texture: Option<Arc<Texture>>,
-    material: Material,
-    default_textures: DefaultTextures,
+    albedo_texture: Option<Arc<Texture>>,
+    metallic_roughness_texture: Option<Arc<Texture>>,
+    normal_texture: Option<Arc<Texture>>,
+    metallic_factor: f32,
+    roughness_factor: f32,
+    base_color: Vec4,
     descriptor_sets: Vec<vk::DescriptorSet>,
 }
 
@@ -539,10 +386,31 @@ impl Model {
                         .expect("Failed to free memory");
                 }
                 self.texture_cache.cleanup(device, allocator);
-                mesh.default_textures.destroy(device, allocator);
             }
         }
     }
+}
+
+fn resize_texture(image: &image::DynamicImage, max_dimension: u32) -> image::DynamicImage {
+    let width = image.width();
+    let height = image.height();
+
+    if width <= max_dimension && height <= max_dimension {
+        return image.clone();
+    }
+
+    let aspect_ratio = width as f32 / height as f32;
+    let (new_width, new_height) = if width > height {
+        let w = max_dimension;
+        let h = (w as f32 / aspect_ratio) as u32;
+        (w, h)
+    } else {
+        let h = max_dimension;
+        let w = (h as f32 * aspect_ratio) as u32;
+        (w, h)
+    };
+
+    image.resize(new_width, new_height, image::imageops::FilterType::Lanczos3)
 }
 
 fn load_texture_from_gltf(
@@ -557,33 +425,26 @@ fn load_texture_from_gltf(
     let img_data =
         gltf::image::Data::from_source(texture.source().source(), Some(path), buffers).ok()?;
 
-    tracing::info!(
-        "Original texture dimensions: {}x{}",
-        img_data.width,
-        img_data.height
+    tracing::info!("WIDTH: {}", img_data.width);
+    tracing::info!("HEIGHT: {}", img_data.height);
+
+    // Resize texture if needed
+    let image = image::DynamicImage::ImageRgb8(
+        image::RgbImage::from_raw(img_data.width, img_data.height, img_data.pixels).unwrap(),
     );
 
-    // Convert to RGB/RGBA
-    let pixels_rgba = if img_data.pixels.len() == (img_data.width * img_data.height * 3) as usize {
-        // Image is RGB, convert to RGBA
-        tracing::info!("Converting RGB to RGBA");
-        let mut rgba_data = Vec::with_capacity((img_data.width * img_data.height * 4) as usize);
-        for chunk in img_data.pixels.chunks_exact(3) {
-            rgba_data.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
-        }
-        rgba_data
-    } else {
-        // Assume it's already RGBA
-        img_data.pixels
-    };
+    const MAX_TEXTURE_DIMENSION: u32 = 2048; // Adjust this value based on your needs
+    let resized = resize_texture(&image, MAX_TEXTURE_DIMENSION);
+
+    let pixels_rgba = resized.to_rgba8().into_raw();
 
     Some(Texture::new(
         device,
         allocator,
         command_pool,
         queue,
-        img_data.width,
-        img_data.height,
+        resized.width(),
+        resized.height(),
         &pixels_rgba,
     ))
 }
@@ -650,25 +511,17 @@ fn process_node(
 
     if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
-            let material = Material::from_gltf(
-                &primitive.material(),
-                device,
-                allocator.clone(),
-                command_pool,
-                queue,
-                path,
-                texture_cache,
-                buffers,
-            );
+            let material = primitive.material();
+            let pbr = material.pbr_metallic_roughness();
 
-            let texture = primitive
-                .material()
-                .pbr_metallic_roughness()
-                .base_color_texture()
-                .and_then(|tex| {
-                    // Create a unique key for the texture
-                    let key = format!("{:?}", tex.texture().source().source());
-                    texture_cache.get_or_load_texture(key, || {
+            let base_color = pbr.base_color_factor();
+            let metallic_factor = pbr.metallic_factor();
+            let roughness_factor = pbr.roughness_factor();
+
+            let albedo_texture = pbr.base_color_texture().and_then(|tex| {
+                texture_cache.get_or_load_texture(
+                    format!("albedo_{:?}", tex.texture().source().source()),
+                    || {
                         load_texture_from_gltf(
                             device,
                             allocator.clone(),
@@ -678,8 +531,43 @@ fn process_node(
                             buffers,
                             path,
                         )
-                    })
-                });
+                    },
+                )
+            });
+
+            let metallic_roughness_texture = pbr.base_color_texture().and_then(|tex| {
+                texture_cache.get_or_load_texture(
+                    format!("mr_{:?}", tex.texture().source().source()),
+                    || {
+                        load_texture_from_gltf(
+                            device,
+                            allocator.clone(),
+                            command_pool,
+                            queue,
+                            &tex.texture(),
+                            buffers,
+                            path,
+                        )
+                    },
+                )
+            });
+
+            let normal_texture = pbr.base_color_texture().and_then(|tex| {
+                texture_cache.get_or_load_texture(
+                    format!("norm_{:?}", tex.texture().source().source()),
+                    || {
+                        load_texture_from_gltf(
+                            device,
+                            allocator.clone(),
+                            command_pool,
+                            queue,
+                            &tex.texture(),
+                            buffers,
+                            path,
+                        )
+                    },
+                )
+            });
 
             let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
 
@@ -724,18 +612,17 @@ fn process_node(
                 let (vertex_buffer, vertex_buffer_allocation) =
                     create_vertex_buffer(device, allocator.clone(), command_pool, queue, &vertices);
 
-                let default_textures =
-                    DefaultTextures::new(device, allocator.clone(), command_pool, queue);
-
                 meshes.push(Mesh {
                     vertex_buffer,
                     vertex_buffer_allocation: Some(vertex_buffer_allocation),
                     vertex_count: vertices.len() as u32,
-                    // Store identity matrix, it is not used here anymore
+                    albedo_texture,
+                    metallic_roughness_texture,
+                    normal_texture,
+                    metallic_factor,
+                    roughness_factor,
+                    base_color: base_color.into(),
                     transform: Mat4::IDENTITY,
-                    texture,
-                    material,
-                    default_textures,
                     descriptor_sets: Vec::new(),
                 });
             }
@@ -1109,23 +996,27 @@ impl RendererInner {
         swapchain_count: usize,
     ) -> Vec<vk::DescriptorSetLayout> {
         let bindings = [
-            // Binding 0: Uniform buffer
             vk::DescriptorSetLayoutBinding::builder()
                 .binding(0)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                 .build(),
-            // Binding 1: Texture sampler
             vk::DescriptorSetLayoutBinding::builder()
                 .binding(1)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
                 .build(),
             vk::DescriptorSetLayoutBinding::builder()
                 .binding(2)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .build(),
+            vk::DescriptorSetLayoutBinding::builder()
+                .binding(3)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT)
                 .build(),
@@ -1147,6 +1038,9 @@ impl RendererInner {
         descriptor_pool: vk::DescriptorPool,
         descriptor_set_layouts: &[vk::DescriptorSetLayout],
         uniform_buffers: &[Buffer],
+        allocator: Arc<Mutex<Allocator>>,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
         mesh: &Mesh,
     ) -> Vec<vk::DescriptorSet> {
         let descriptor_sets = unsafe {
@@ -1159,6 +1053,17 @@ impl RendererInner {
                 .expect("failed to allocate descriptor sets")
         };
 
+        let default_texture =
+            create_default_texture(device, allocator.clone(), command_pool, queue);
+        let default_metallic_roughness = create_default_metallic_roughness_texture(
+            device,
+            allocator.clone(),
+            command_pool,
+            queue,
+        );
+        let default_normal =
+            create_default_normal_texture(device, allocator.clone(), command_pool, queue);
+
         for (index, &descriptor_set) in descriptor_sets.iter().enumerate() {
             let buffer_info = vk::DescriptorBufferInfo::builder()
                 .buffer(uniform_buffers[index])
@@ -1166,43 +1071,59 @@ impl RendererInner {
                 .range(vk::WHOLE_SIZE)
                 .build();
 
-            let mut descriptor_writes = vec![vk::WriteDescriptorSet::builder()
-                .dst_set(descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(std::slice::from_ref(&buffer_info))
-                .build()];
+            let albedo_texture = mesh.albedo_texture.as_ref().unwrap_or(&default_texture);
+            let albedo_info = vk::DescriptorImageInfo::builder()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(albedo_texture.image_view)
+                .sampler(albedo_texture.sampler)
+                .build();
 
-            if let Some(ref texture) = mesh.texture {
-                // Image view descriptor
-                let image_info = vk::DescriptorImageInfo::builder()
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image_view(texture.image_view)
-                    .build();
+            let metallic_roughness_texture = mesh
+                .metallic_roughness_texture
+                .as_ref()
+                .unwrap_or(&default_metallic_roughness);
+            let metallic_roughness_info = vk::DescriptorImageInfo::builder()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(metallic_roughness_texture.image_view)
+                .sampler(metallic_roughness_texture.sampler)
+                .build();
 
-                descriptor_writes.push(
-                    vk::WriteDescriptorSet::builder()
-                        .dst_set(descriptor_set)
-                        .dst_binding(1)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(std::slice::from_ref(&image_info))
-                        .build(),
-                );
+            let normal_texture = mesh.normal_texture.as_ref().unwrap_or(&default_normal);
+            let normal_info = vk::DescriptorImageInfo::builder()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(normal_texture.image_view)
+                .sampler(normal_texture.sampler)
+                .build();
 
-                // Sampler descriptor
-                let sampler_info = vk::DescriptorImageInfo::builder()
-                    .sampler(texture.sampler)
-                    .build();
-
-                descriptor_writes.push(
-                    vk::WriteDescriptorSet::builder()
-                        .dst_set(descriptor_set)
-                        .dst_binding(2)
-                        .descriptor_type(vk::DescriptorType::SAMPLER)
-                        .image_info(std::slice::from_ref(&sampler_info))
-                        .build(),
-                );
-            }
+            let descriptor_writes = [
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(descriptor_set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(std::slice::from_ref(&buffer_info))
+                    .build(),
+                // albedo
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(descriptor_set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&albedo_info))
+                    .build(),
+                // metallic
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(descriptor_set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&metallic_roughness_info))
+                    .build(),
+                // norm
+                vk::WriteDescriptorSet::builder()
+                    .dst_set(descriptor_set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&normal_info))
+                    .build(),
+            ];
 
             unsafe {
                 device.update_descriptor_sets(&descriptor_writes, &[]);
@@ -1788,7 +1709,10 @@ impl RendererInner {
                 descriptor_pool,
                 &descriptor_set_layouts,
                 &uniform_buffers,
-                mesh,
+                allocator.clone(),
+                command_pool,
+                queue,
+                &mesh,
             );
         }
 
@@ -2023,10 +1947,13 @@ impl RendererInner {
                         0.1,
                         1000.0,
                     ),
-                    // camera_pos: self.camera_position,
-                    // metallic_factor: mesh.material.metallic_factor,
-                    // roughness_factor: mesh.material.roughness_factor,
-                    // base_color: mesh.material.base_color,
+                    camera_pos: self.camera_position,
+                    material: Material {
+                        base_color: mesh.base_color,
+                        metallic_factor: mesh.metallic_factor,
+                        roughness_factor: mesh.roughness_factor,
+                        _padding: [0.0, 0.0],
+                    },
                 };
 
                 let ptr = self.uniform_buffer_allocations[self.current_frame]
@@ -2223,4 +2150,58 @@ fn clamped_color(color: Vec3) -> Vec3 {
         color.y.clamp(0.0, 1.0),
         color.z.clamp(0.0, 1.0),
     )
+}
+
+fn create_default_texture(
+    device: &Device,
+    allocator: Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+) -> Arc<Texture> {
+    let white_pixel = vec![255u8, 255, 255, 255];
+    Arc::new(Texture::new(
+        device,
+        allocator,
+        command_pool,
+        queue,
+        1,
+        1,
+        &white_pixel,
+    ))
+}
+
+fn create_default_metallic_roughness_texture(
+    device: &Device,
+    allocator: Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+) -> Arc<Texture> {
+    let pixel = vec![0u8, 0, 255, 255]; // Non-metallic (0), rough (1.0)
+    Arc::new(Texture::new(
+        device,
+        allocator,
+        command_pool,
+        queue,
+        1,
+        1,
+        &pixel,
+    ))
+}
+
+fn create_default_normal_texture(
+    device: &Device,
+    allocator: Arc<Mutex<Allocator>>,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+) -> Arc<Texture> {
+    let pixel = vec![128u8, 128, 255, 255]; // Default normal pointing up
+    Arc::new(Texture::new(
+        device,
+        allocator,
+        command_pool,
+        queue,
+        1,
+        1,
+        &pixel,
+    ))
 }

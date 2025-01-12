@@ -17,8 +17,8 @@ pub struct UniformBufferObject {
     pub model: Mat4,
     pub view: Mat4,
     pub proj: Mat4,
-    // pub camera_pos: Vec3,
-    // pub material: Material,
+    pub camera_pos: Vec3,
+    pub material: Material,
 }
 
 #[repr(C)]

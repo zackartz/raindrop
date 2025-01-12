@@ -11,6 +11,7 @@ use spirv_std::glam::{Mat4, Vec3, Vec4};
 use std::{
     ffi::CString,
     mem::ManuallyDrop,
+    panic,
     path::Path,
     sync::{Arc, Mutex},
     time::Instant,
@@ -31,6 +32,91 @@ macro_rules! include_spirv {
             })
             .collect::<Vec<u32>>()
     }};
+}
+
+pub struct DefaultTextures {
+    white: Texture,              // Default albedo (white)
+    metallic_roughness: Texture, // Default metallic-roughness (black metallic, 0.5 roughness)
+    normal: Texture,             // Default normal map (flat normal)
+    sampler: vk::Sampler,        // Common sampler for all textures
+}
+
+pub struct Material {
+    base_color: Vec4,
+    metallic_factor: f32,
+    roughness_factor: f32,
+    base_color_texture: Option<Arc<Texture>>,
+    // metallic_roughness_texture: Option<Arc<Texture>>,
+    // normal_texture: Option<Arc<Texture>>,
+}
+
+impl Material {
+    fn from_gltf(
+        material: &gltf::Material,
+        device: &Device,
+        allocator: Arc<Mutex<Allocator>>,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+        path: &Path,
+        texture_cache: &mut TextureCache,
+        buffers: &[gltf::buffer::Data],
+    ) -> Self {
+        let pbr = material.pbr_metallic_roughness();
+
+        let base_color = pbr.base_color_factor();
+        let metallic_factor = pbr.metallic_factor();
+        let roughness_factor = pbr.roughness_factor();
+
+        let base_color_texture = pbr.base_color_texture().and_then(|tex| {
+            let key = format!("{:?}", tex.texture().source().source());
+            texture_cache.get_or_load_texture(key, || {
+                load_texture_from_gltf(
+                    device,
+                    allocator.clone(),
+                    command_pool,
+                    queue,
+                    &tex.texture(),
+                    buffers,
+                    path,
+                )
+            })
+        });
+
+        // let metallic_roughness_texture = pbr.metallic_roughness_texture().and_then(|tex| {
+        //     load_texture_from_gltf(
+        //         device,
+        //         allocator.clone(),
+        //         command_pool,
+        //         queue,
+        //         &tex.texture(),
+        //         buffers,
+        //         path,
+        //     )
+        //     .map(Arc::new)
+        // });
+        //
+        // let normal_texture = material.normal_texture().and_then(|tex| {
+        //     load_texture_from_gltf(
+        //         device,
+        //         allocator.clone(),
+        //         command_pool,
+        //         queue,
+        //         &tex.texture(),
+        //         buffers,
+        //         path,
+        //     )
+        //     .map(Arc::new)
+        // });
+
+        Self {
+            base_color: Vec4::from(base_color),
+            metallic_factor,
+            roughness_factor,
+            base_color_texture,
+            // metallic_roughness_texture,
+            // normal_texture,
+        }
+    }
 }
 
 #[repr(C)]
@@ -94,7 +180,7 @@ impl Texture {
 
         let buffer_size = data.len() as u64;
 
-        println!("DATA LEN: {}", buffer_size);
+        tracing::info!("DATA LEN: {}", buffer_size);
         let staging_buffer = unsafe {
             device
                 .create_buffer(
@@ -348,12 +434,92 @@ impl Texture {
     }
 }
 
+impl DefaultTextures {
+    fn new(
+        device: &Device,
+        allocator: Arc<Mutex<Allocator>>,
+        command_pool: vk::CommandPool,
+        queue: vk::Queue,
+    ) -> Self {
+        // Create a 1x1 white texture for default albedo
+        let white_data = vec![255u8, 255, 255, 255];
+        let white = Texture::new(
+            device,
+            allocator.clone(),
+            command_pool,
+            queue,
+            1,
+            1,
+            &white_data,
+        );
+
+        // Create a 1x1 default metallic-roughness texture
+        // R: unused, G: roughness (0.5), B: metallic (0.0)
+        let metallic_roughness_data = vec![0u8, 128, 0, 255];
+        let metallic_roughness = Texture::new(
+            device,
+            allocator.clone(),
+            command_pool,
+            queue,
+            1,
+            1,
+            &metallic_roughness_data,
+        );
+
+        // Create a 1x1 default normal map (pointing up)
+        let normal_data = vec![128u8, 128, 255, 255];
+        let normal = Texture::new(device, allocator, command_pool, queue, 1, 1, &normal_data);
+
+        // Create a common sampler
+        let sampler_create_info = vk::SamplerCreateInfo::builder()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(true)
+            .max_anisotropy(16.0)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false)
+            .compare_enable(false)
+            .compare_op(vk::CompareOp::ALWAYS)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .mip_lod_bias(0.0)
+            .min_lod(0.0)
+            .max_lod(0.0);
+
+        let sampler = unsafe {
+            device
+                .create_sampler(&sampler_create_info, None)
+                .expect("Failed to create sampler")
+        };
+
+        Self {
+            white,
+            metallic_roughness,
+            normal,
+            sampler,
+        }
+    }
+
+    fn destroy(&mut self, device: &Device, allocator: &mut Allocator) {
+        unsafe {
+            self.white.destroy(device, allocator);
+            self.metallic_roughness.destroy(device, allocator);
+            self.normal.destroy(device, allocator);
+            device.destroy_sampler(self.sampler, None);
+        }
+    }
+}
+
 pub struct Mesh {
     vertex_buffer: Buffer,
     vertex_buffer_allocation: Option<Allocation>,
     vertex_count: u32,
     transform: Mat4,
     texture: Option<Arc<Texture>>,
+    material: Material,
+    default_textures: DefaultTextures,
     descriptor_sets: Vec<vk::DescriptorSet>,
 }
 
@@ -373,6 +539,7 @@ impl Model {
                         .expect("Failed to free memory");
                 }
                 self.texture_cache.cleanup(device, allocator);
+                mesh.default_textures.destroy(device, allocator);
             }
         }
     }
@@ -390,15 +557,16 @@ fn load_texture_from_gltf(
     let img_data =
         gltf::image::Data::from_source(texture.source().source(), Some(path), buffers).ok()?;
 
-    println!(
+    tracing::info!(
         "Original texture dimensions: {}x{}",
-        img_data.width, img_data.height
+        img_data.width,
+        img_data.height
     );
 
     // Convert to RGB/RGBA
     let pixels_rgba = if img_data.pixels.len() == (img_data.width * img_data.height * 3) as usize {
         // Image is RGB, convert to RGBA
-        println!("Converting RGB to RGBA");
+        tracing::info!("Converting RGB to RGBA");
         let mut rgba_data = Vec::with_capacity((img_data.width * img_data.height * 4) as usize);
         for chunk in img_data.pixels.chunks_exact(3) {
             rgba_data.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
@@ -482,6 +650,17 @@ fn process_node(
 
     if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
+            let material = Material::from_gltf(
+                &primitive.material(),
+                device,
+                allocator.clone(),
+                command_pool,
+                queue,
+                path,
+                texture_cache,
+                buffers,
+            );
+
             let texture = primitive
                 .material()
                 .pbr_metallic_roughness()
@@ -545,6 +724,9 @@ fn process_node(
                 let (vertex_buffer, vertex_buffer_allocation) =
                     create_vertex_buffer(device, allocator.clone(), command_pool, queue, &vertices);
 
+                let default_textures =
+                    DefaultTextures::new(device, allocator.clone(), command_pool, queue);
+
                 meshes.push(Mesh {
                     vertex_buffer,
                     vertex_buffer_allocation: Some(vertex_buffer_allocation),
@@ -552,6 +734,8 @@ fn process_node(
                     // Store identity matrix, it is not used here anymore
                     transform: Mat4::IDENTITY,
                     texture,
+                    material,
+                    default_textures,
                     descriptor_sets: Vec::new(),
                 });
             }
@@ -1199,7 +1383,7 @@ impl RendererInner {
         render_pass: vk::RenderPass,
     ) -> (vk::Pipeline, vk::PipelineLayout) {
         let vertex_shader_module = {
-            let spirv = include_spirv!("../shaders/main_vs.spv");
+            let spirv = include_spirv!("../../../shader-cache/main.vert.spv");
             let shader_module_create_info = vk::ShaderModuleCreateInfo::builder().code(&spirv);
             unsafe {
                 device
@@ -1208,7 +1392,7 @@ impl RendererInner {
             }
         };
         let fragment_shader_module = {
-            let spirv = include_spirv!("../shaders/main_fs.spv");
+            let spirv = include_spirv!("../../../shader-cache/main.frag.spv");
             let shader_module_create_info = vk::ShaderModuleCreateInfo::builder().code(&spirv);
             unsafe {
                 device
@@ -1216,8 +1400,8 @@ impl RendererInner {
                     .expect("Failed to create shader module")
             }
         };
-        let main_function_name_fs = CString::new("main_fs").unwrap();
-        let main_function_name_vs = CString::new("main_vs").unwrap();
+        let main_function_name_fs = CString::new("main").unwrap();
+        let main_function_name_vs = CString::new("main").unwrap();
         let pipeline_shader_stages = [
             vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -1558,7 +1742,7 @@ impl RendererInner {
             );
 
         let t = Instant::now();
-        println!("loading model!");
+        tracing::info!("loading model!");
         let mut model = Model::load(
             &device,
             allocator.clone(),
@@ -1566,7 +1750,7 @@ impl RendererInner {
             queue,
             "./sponza/NewSponza_Main_glTF_003.gltf",
         );
-        println!(
+        tracing::info!(
             "loaded {} meshes in {:.2} seconds!",
             model.meshes.len(),
             t.elapsed().as_secs_f32()
@@ -1839,7 +2023,10 @@ impl RendererInner {
                         0.1,
                         1000.0,
                     ),
-                    model_color: self.model_color,
+                    // camera_pos: self.camera_position,
+                    // metallic_factor: mesh.material.metallic_factor,
+                    // roughness_factor: mesh.material.roughness_factor,
+                    // base_color: mesh.material.base_color,
                 };
 
                 let ptr = self.uniform_buffer_allocations[self.current_frame]

@@ -16,6 +16,8 @@ raw-window-handle = "0.6"
 gpu-allocator = { version = "0.25.0", features = ["vulkan"] }
 glam = { version = "0.22", default-features = false, features = ["libm"] }
 bytemuck = "1.21.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu.git" }
 spirv-std = { git = "https://github.com/Rust-GPU/rust-gpu.git" }

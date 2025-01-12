@@ -2,13 +2,23 @@
 
 use spirv_std::glam::{Mat4, Vec3, Vec4};
 
-#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(16))]
+pub struct Material {
+    pub base_color: Vec4,
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
+    pub _padding: [f32; 2],
+}
+
+#[repr(C, align(16))]
 #[derive(Clone)]
 pub struct UniformBufferObject {
     pub model: Mat4,
     pub view: Mat4,
     pub proj: Mat4,
-    pub model_color: Vec3,
+    // pub camera_pos: Vec3,
+    // pub material: Material,
 }
 
 #[repr(C)]

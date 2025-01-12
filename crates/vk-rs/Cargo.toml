@@ -26,6 +26,8 @@ gltf = { version = "1.4.1", features = ["import"] }
 image = "0.25.5"
 rayon = "1.10.0"
 bytemuck.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [build-dependencies]
-spirv-builder.workspace = true
+shaderc = "0.8"

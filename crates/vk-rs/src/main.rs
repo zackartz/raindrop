@@ -276,21 +276,21 @@ impl MyAppCreator {
         p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
         _p_user_data: *mut std::ffi::c_void,
     ) -> vk::Bool32 {
-        let severity = match message_severity {
-            vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => "[VERBOSE]",
-            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => "[WARNING]",
-            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => "[ERROR]",
-            vk::DebugUtilsMessageSeverityFlagsEXT::INFO => "[INFO]",
-            _ => panic!("[UNKNOWN]"),
-        };
         let types = match message_types {
             vk::DebugUtilsMessageTypeFlagsEXT::GENERAL => "[GENERAL]",
             vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE => "[PERFORMANCE]",
             vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION => "[VALIDATION]",
             _ => panic!("[UNKNOWN]"),
         };
+
         let message = std::ffi::CStr::from_ptr((*p_callback_data).p_message);
-        println!("[DEBUG]{}{}{:?}", severity, types, message);
+        match message_severity {
+            vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => tracing::trace!("{types}{message:?}"),
+            vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => tracing::warn!("{types}{message:?}"),
+            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => tracing::error!("{types}{message:?}"),
+            vk::DebugUtilsMessageSeverityFlagsEXT::INFO => tracing::info!("{types}{message:?}"),
+            _ => tracing::debug!("{types}{message:?}"),
+        };
 
         vk::FALSE
     }
@@ -680,6 +680,7 @@ impl AppCreator<Arc<Mutex<Allocator>>> for MyAppCreator {
 }
 
 fn main() -> std::process::ExitCode {
+    tracing_subscriber::fmt().pretty().init();
     puffin::set_scopes_on(true);
 
     egui_ash::run(

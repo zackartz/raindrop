@@ -68,6 +68,7 @@
               vulkan-headers
               vulkan-loader
               vulkan-validation-layers
+              cmake
             ];
 
             buildInputs = with pkgs; [

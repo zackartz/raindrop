@@ -543,7 +543,9 @@ impl MyAppCreator {
             .build();
         queue_create_infos.push(queue_create_info);
 
-        let physical_device_features = vk::PhysicalDeviceFeatures::builder().build();
+        let physical_device_features = vk::PhysicalDeviceFeatures::builder()
+            .sampler_anisotropy(true)
+            .build();
 
         let enable_extension_names = required_device_extensions
             .iter()

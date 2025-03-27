@@ -18,17 +18,7 @@
     nixpkgs,
     flake-parts,
     ...
-  }: let
-    # For details on these options, See
-    # https://github.com/oxalica/rust-overlay?tab=readme-ov-file#cheat-sheet-common-usage-of-rust-bin
-    #
-    # Channel of the Rust toolchain (stable or beta).
-    rustChannel = "nightly";
-    # Version (latest or specific date/semantic version)
-    rustVersion = "latest";
-    # Profile (default or minimal)
-    rustProfile = "default";
-  in
+  }:
     flake-parts.lib.mkFlake {inherit inputs;} {
       systems = import inputs.systems;
 
@@ -77,6 +67,7 @@
               # WINIT_UNIX_BACKEND=wayland
               wayland
               spirv-tools
+              spirv-cross
               vulkan-loader
             ];
           };

@@ -1,8 +1,0 @@
-[package]
-name = "shaders-shared"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-spirv-std.workspace = true
-bytemuck.workspace = true

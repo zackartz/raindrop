@@ -21,8 +21,8 @@ pub enum GfxHalError {
     MissingExtension(String),
 
     /// A required Vulkan feature is not supported by the physical device.
-    #[error("Missing required Vulkan feature.")]
-    MissingFeature,
+    #[error("Missing required Vulkan feature: {0}")]
+    MissingFeature(String),
 
     /// Failed to find a suitable queue family (e.g., graphics, present).
     #[error("Could not find required queue family: {0}")]

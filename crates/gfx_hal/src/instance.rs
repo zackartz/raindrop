@@ -5,9 +5,13 @@ use std::{
 };
 
 use ash::{ext::debug_utils, vk};
-use winit::raw_window_handle::{DisplayHandle, HasDisplayHandle};
+use winit::raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle};
 
-use crate::error::{GfxHalError, Result};
+use crate::{
+    error::{GfxHalError, Result},
+    physical_device::PhysicalDevice,
+    surface::Surface,
+};
 
 unsafe extern "system" fn vulkan_debug_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -303,39 +307,39 @@ impl Instance {
         Ok(())
     }
 
-    // /// Enumerates all physical devices available to this instance.
-    // ///
-    // /// # Safety
-    // /// The `Instance` must be kept alive while the returned `PhysicalDevices`s are in use.
-    // /// This is ensured by returning `PhysicalDevice`s holding an `Arc<Instance>`.
-    // pub unsafe fn enumerate_phyiscal_devices(self: &Arc<Self>) -> Result<Vec<PhysicalDevice>> {
-    //     let physical_device_handles = self.instance.enumerate_physical_devices()?;
-    //
-    //     if physical_device_handles.is_empty() {
-    //         return Err(GfxHalError::NoSuitableGpu(
-    //             "No Vulkan-compatibile GPUs found.".to_string(),
-    //         ));
-    //     }
-    //
-    //     let devices = physical_device_handles
-    //         .into_iter()
-    //         .map(|handle| PhysicalDevice::new(Arc::clone(self), handle))
-    //         .collect()?;
-    //
-    //     Ok(devices)
-    // }
+    /// Enumerates all physical devices available to this instance.
+    ///
+    /// # Safety
+    /// The `Instance` must be kept alive while the returned `PhysicalDevices`s are in use.
+    /// This is ensured by returning `PhysicalDevice`s holding an `Arc<Instance>`.
+    pub unsafe fn enumerate_physical_devices(self: &Arc<Self>) -> Result<Vec<PhysicalDevice>> {
+        let physical_device_handles = self.instance.enumerate_physical_devices()?;
 
-    // /// Creates a vulkan surface for the given window
-    // ///
-    // /// # Safety
-    // /// The `window_handle_trait_obj` must point to a valid window/display managed by caller.
-    // /// The `Instance` must be kept alive longer than the returned `Surface`
-    // pub unsafe fn create_surface(
-    //     self: &Arc<Self>,
-    //     window_handle_trait_obj: &(impl HasWindowHandle + HasDisplayHandle),
-    // ) -> Result<Arc<Surface>> {
-    //     Surface::new(Arc::clone(self), window_handle_trait_obj)
-    // }
+        if physical_device_handles.is_empty() {
+            return Err(GfxHalError::NoSuitableGpu(
+                "No Vulkan-compatibile GPUs found.".to_string(),
+            ));
+        }
+
+        let devices = physical_device_handles
+            .into_iter()
+            .map(|handle| PhysicalDevice::new(Arc::clone(self), handle))
+            .collect();
+
+        Ok(devices)
+    }
+
+    /// Creates a vulkan surface for the given window
+    ///
+    /// # Safety
+    /// The `window_handle_trait_obj` must point to a valid window/display managed by caller.
+    /// The `Instance` must be kept alive longer than the returned `Surface`
+    pub unsafe fn create_surface(
+        self: &Arc<Self>,
+        window_handle_trait_obj: &(impl HasWindowHandle + HasDisplayHandle),
+    ) -> Result<Arc<Surface>> {
+        Surface::new(Arc::clone(self), window_handle_trait_obj)
+    }
 }
 
 impl Drop for Instance {

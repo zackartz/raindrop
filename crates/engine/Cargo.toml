@@ -4,15 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+egui.workspace = true
 ash.workspace = true
-winit.workspace = true
-raw-window-handle.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-glam.workspace = true
-bytemuck.workspace = true
+winit.workspace = true
+raw-window-handle.workspace = true
 thiserror.workspace = true
-gpu-allocator.workspace = true
 
 gfx_hal = { path = "../gfx_hal" }
+renderer = { path = "../renderer" }
 resource_manager = { path = "../resource_manager" }

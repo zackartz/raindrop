@@ -1,6 +1,8 @@
 use ash::vk;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::ffi::CStr;
+use std::sync::Weak;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::error::{GfxHalError, Result};
@@ -23,12 +25,13 @@ pub struct Device {
 
 impl Device {
     /// Creates a new logical device. Typically called via `PhysicalDevice::create_logical_device`.
+    /// Uses a two-stage initialization to avoid Arc::new_cyclic issues.
     ///
-    /// # Saftey
+    /// # Safety
     /// - `instance` and `physical_device_handle` must be valid.
     /// - `queue_family_indicies` must be valid indicies obtained from the `physical_device_handle`.
     /// - `required_extensions` must be supported by the `physical_device_handle`.
-    /// - `enabled_features` and `mesh_features` must be supported by the `physical_device_handle`.
+    /// - All feature structs passed must be supported by the `physical_device_handle`.
     pub(crate) unsafe fn new(
         instance: Arc<Instance>,
         physical_device_handle: vk::PhysicalDevice,
@@ -36,22 +39,26 @@ impl Device {
         required_extensions: &[&CStr],
         enabled_features: &vk::PhysicalDeviceFeatures,
         mesh_features: Option<&vk::PhysicalDeviceMeshShaderFeaturesEXT>,
+        dynamic_rendering_features: &vk::PhysicalDeviceDynamicRenderingFeatures,
+        buffer_device_address_features: &vk::PhysicalDeviceBufferDeviceAddressFeatures,
+        // Add other feature structs here as needed...
     ) -> Result<Arc<Self>> {
+        // --- 1. Prepare Queue Create Infos (Same as before) ---
         let mut queue_create_infos = Vec::new();
-        let mut unique_queue_families = std::collections::HashSet::new();
-
+        let mut unique_queue_families = HashSet::new();
         let graphics_family = queue_family_indicies.graphics_family.ok_or_else(|| {
             GfxHalError::MissingQueueFamily("Graphics Queue Family Missing".to_string())
         })?;
         unique_queue_families.insert(graphics_family);
-
         if let Some(compute_family) = queue_family_indicies.compute_family {
             unique_queue_families.insert(compute_family);
         }
         if let Some(transfer_family) = queue_family_indicies.transfer_family {
             unique_queue_families.insert(transfer_family);
         }
-
+        if let Some(present_family) = queue_family_indicies.present_family {
+            unique_queue_families.insert(present_family);
+        }
         let queue_priorities = [1.0f32];
         for &family_index in &unique_queue_families {
             let queue_create_info = vk::DeviceQueueCreateInfo::default()
@@ -60,74 +67,94 @@ impl Device {
             queue_create_infos.push(queue_create_info);
         }
 
+        // --- 2. Prepare Feature Chain (Same as before) ---
         let extension_names_raw: Vec<*const i8> =
             required_extensions.iter().map(|s| s.as_ptr()).collect();
-
         let mut features2 = vk::PhysicalDeviceFeatures2::default().features(*enabled_features);
         let mut mesh_features_copy;
-
         if let Some(mesh_feats) = mesh_features {
             mesh_features_copy = *mesh_feats;
             features2 = features2.push_next(&mut mesh_features_copy);
         }
+        let mut dyn_rendering_feats_copy = *dynamic_rendering_features;
+        if dyn_rendering_feats_copy.dynamic_rendering != vk::TRUE {
+            return Err(GfxHalError::MissingFeature("Dynamic Rendering".to_string()));
+        }
+        features2 = features2.push_next(&mut dyn_rendering_feats_copy);
+        let mut bda_features_copy = *buffer_device_address_features;
+        if bda_features_copy.buffer_device_address != vk::TRUE {
+            return Err(GfxHalError::MissingFeature(
+                "Buffer Device Address".to_string(),
+            ));
+        }
+        features2 = features2.push_next(&mut bda_features_copy);
+        // Chain other features here...
 
+        // --- 3. Create the SINGLE ash::Device (Same as before) ---
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&extension_names_raw)
             .push_next(&mut features2);
-
         tracing::info!(
             "Creating logical device with extensions: {:?}",
             required_extensions
         );
-        let device = instance.ash_instance().create_device(
+        let ash_device = instance.ash_instance().create_device(
             physical_device_handle,
             &device_create_info,
             None,
         )?;
-        tracing::info!("logical device created successfully.");
+        tracing::info!(
+            "Logical device created successfully (ash::Device handle: {:?}).",
+            ash_device.handle()
+        );
 
-        let mut queues_map = HashMap::new();
-        let arc_device_placeholder = Arc::new(Self {
-            instance,
+        // --- 4. Create the Device struct in an Arc (Stage 1) ---
+        // Initialize the queues map as empty for now.
+        let device_arc = Arc::new(Device {
+            instance: instance.clone(),
             physical_device: physical_device_handle,
-            device,
-            queues: Mutex::new(HashMap::new()),
+            device: ash_device, // Move the created ash::Device here
+            queues: Mutex::new(HashMap::new()), // Start with empty map
             graphics_queue_family_index: graphics_family,
             compute_queue_family_index: queue_family_indicies.compute_family,
             transfer_queue_family_index: queue_family_indicies.transfer_family,
         });
+        tracing::debug!(
+            "Device Arc created (Stage 1) with ash::Device handle: {:?}",
+            device_arc.raw().handle()
+        );
 
+        // --- 5. Create Queues and Populate Map (Stage 2) ---
+        // Now that we have the final Arc<Device>, we can create the Queues.
+        let mut queues_to_insert = HashMap::new();
         for &family_index in &unique_queue_families {
-            let queue_handler = arc_device_placeholder
-                .device
-                .get_device_queue(family_index, 0);
+            // Get the Vulkan queue handle using the device stored in the Arc
+            // Assuming queue index 0 for simplicity
+            let vk_queue_handle = device_arc.device.get_device_queue(family_index, 0);
+
+            // Create the Queue wrapper, passing a clone of the device_arc
             let queue_wrapper = Arc::new(Queue::new(
-                Arc::clone(&arc_device_placeholder),
-                queue_handler,
+                device_arc.clone(), // Pass the Arc<Device>
+                vk_queue_handle,
                 family_index,
             ));
-            queues_map.insert((family_index, 0), queue_wrapper);
+            queues_to_insert.insert((family_index, 0), queue_wrapper);
+            tracing::trace!("Created queue wrapper for family {}", family_index);
         }
 
-        let device_handle = unsafe {
-            arc_device_placeholder
-                .instance
-                .ash_instance()
-                .create_device(physical_device_handle, &device_create_info, None)?
-        };
+        // Lock the mutex and insert the created queues into the map within the Arc<Device>
+        {
+            // Scope for the mutex guard
+            let mut queues_map_guard = device_arc.queues.lock();
+            *queues_map_guard = queues_to_insert; // Replace the empty map with the populated one
+            tracing::debug!(
+                "Device Arc populated with {} queues (Stage 2).",
+                queues_map_guard.len()
+            );
+        } // Mutex guard is dropped here
 
-        let final_device = Arc::new(Self {
-            instance: Arc::clone(&arc_device_placeholder.instance), // Clone from placeholder
-            physical_device: physical_device_handle,
-            device: device_handle,          // Use the newly created handle
-            queues: Mutex::new(queues_map), // Use the populated map
-            graphics_queue_family_index: graphics_family,
-            compute_queue_family_index: queue_family_indicies.compute_family,
-            transfer_queue_family_index: queue_family_indicies.transfer_family,
-        });
-
-        Ok(final_device)
+        Ok(device_arc) // Return the fully initialized Arc<Device>
     }
 
     /// Provides raw access to the underlying `ash::Device`.
@@ -210,6 +237,8 @@ impl PhysicalDevice {
         queue_family_indices: &QueueFamilyIndices,
         enabled_features: &vk::PhysicalDeviceFeatures,
         mesh_features: Option<&vk::PhysicalDeviceMeshShaderFeaturesEXT>,
+        dynamic_rendering_features: &vk::PhysicalDeviceDynamicRenderingFeatures,
+        buffer_device_address_features: &vk::PhysicalDeviceBufferDeviceAddressFeatures,
     ) -> Result<Arc<Device>> {
         Device::new(
             Arc::clone(self.instance()),
@@ -218,6 +247,8 @@ impl PhysicalDevice {
             required_extensions,
             enabled_features,
             mesh_features,
+            dynamic_rendering_features,
+            buffer_device_address_features,
         )
     }
 }

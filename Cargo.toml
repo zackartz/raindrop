@@ -1,7 +1,12 @@
 [workspace]
 resolver = "2"
 
-members = ["crates/engine", "crates/gfx_hal", "crates/resource_manager"]
+members = [
+  "crates/engine",
+  "crates/gfx_hal",
+  "crates/renderer",
+  "crates/resource_manager",
+]
 
 [workspace.dependencies]
 ash = { version = "0.38" }
@@ -14,9 +19,14 @@ glam = { version = "0.22", default-features = false, features = [
   "libm",
   "bytemuck",
 ] }
+egui-ash-renderer = { version = "0.8.0", features = [
+  "gpu-allocator",
+  "dynamic-rendering",
+] }
+egui = "0.31"
 bytemuck = { version = "1.21.0", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["json"] }
 parking_lot = "0.12.3"
 thiserror = "2.0.12"
 

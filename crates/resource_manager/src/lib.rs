@@ -164,6 +164,11 @@ impl ResourceManager {
         })
     }
 
+    /// Gets a shared reference to the Allocator
+    pub fn allocator(&self) -> Arc<Mutex<Allocator>> {
+        self.allocator.clone()
+    }
+
     /// Gets or initializes the TransferSetup resources.
     fn get_transfer_setup(&self) -> Result<TransferSetup> {
         let mut setup_guard = self.transfer_setup.lock();
@@ -254,7 +259,9 @@ impl ResourceManager {
         // Submit
         let submits = [vk::SubmitInfo::default().command_buffers(&binding)];
         // Use the transfer queue and fence
-        transfer_setup.queue.submit(&submits, None)?; // Submit without fence initially
+        transfer_setup
+            .queue
+            .submit(self.device.raw(), &submits, None)?; // Submit without fence initially
 
         // Wait for completion using a separate wait call
         // This avoids holding the queue's internal submit lock during the wait.

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ash::vk;
+use ash::{vk, Device as AshDevice};
 use parking_lot::Mutex;
 
 use crate::device::Device;
@@ -46,25 +46,41 @@ impl Queue {
         &self.device
     }
 
-    /// Submits command buffers to the queue.
+    /// Submits command buffers to the queue using the provided device handle.
     ///
     /// This method acquires an internal lock for the duration of the submission call
     /// to prevent concurrent `vkQueueSubmit` calls on the same queue from this wrapper.
     ///
     /// # Arguments
+    /// * `submit_device_raw` - The `ash::Device` handle corresponding to the device that owns the resources in `submits` and the `signal_fence`.
     /// * `submits` - A slice of `vk::SubmitInfo` describing the work to submit.
-    /// * `signal_fence` - An optional `Fence` to signal when the submission completes.
+    /// * `signal_fence` - An optional `Fence` to signal when the submission completes. The fence must have been created with the same logical device as `submit_device_raw`.
     ///
     /// # Safety
-    /// - The command buffers and synchronization primitieves within `submits` must be valid.
-    /// - The `signal_fence`, if provided, must be valid and unsignaled.
+    /// - `submit_device_raw` must be the correct, valid `ash::Device` handle associated with the resources being submitted.
+    /// - The command buffers and synchronization primitives within `submits` must be valid and owned by the same logical device as `submit_device_raw`.
+    /// - The `signal_fence`, if provided, must be valid, unsignaled, and owned by the same logical device as `submit_device_raw`.
     pub unsafe fn submit(
         &self,
+        submit_device_raw: &AshDevice, // <<< Accept the ash::Device to use
         submits: &[vk::SubmitInfo],
         signal_fence: Option<&Fence>,
     ) -> Result<()> {
+        debug_assert!(
+            self.device.raw().handle() == submit_device_raw.handle(),
+            "Queue::submit called with an ash::Device from a different logical VkDevice than the queue belongs to!"
+        );
+        // Optional: Check fence device consistency
+        if let Some(fence) = signal_fence {
+            debug_assert!(
+                 fence.device().raw().handle() == submit_device_raw.handle(),
+                 "Fence passed to Queue::submit belongs to a different logical device than submit_device_raw!"
+             );
+        }
+
         let fence_handle = signal_fence.map_or(vk::Fence::null(), |f| f.handle());
 
+        // Keep the lock for thread-safety on the VkQueue object itself
         let _lock = self.submit_lock.lock();
 
         tracing::trace!(
@@ -72,9 +88,10 @@ impl Queue {
             submits.len(),
             self.family_index
         );
-        self.device
-            .raw()
-            .queue_submit(self.queue, submits, fence_handle)?;
+
+        // Use the EXPLICITLY PASSED submit_device_raw for the Vulkan call
+        submit_device_raw.queue_submit(self.queue, submits, fence_handle)?;
+
         tracing::trace!("Submission successful.");
         Ok(())
     }

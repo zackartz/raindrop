@@ -64,6 +64,7 @@
             buildInputs = with pkgs; [
               libxkbcommon
               libGL
+              python3
               # WINIT_UNIX_BACKEND=wayland
               wayland
               spirv-tools

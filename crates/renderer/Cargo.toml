@@ -1,0 +1,24 @@
+[package]
+name = "renderer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+gpu-allocator.workspace = true
+egui.workspace = true
+egui-ash-renderer.workspace = true
+winit.workspace = true
+parking_lot.workspace = true
+
+gfx_hal = { path = "../gfx_hal" }
+resource_manager = { path = "../resource_manager" }
+
+[build-dependencies]
+shaderc = "0.9.1"
+walkdir = "2"
+anyhow = "1.0"

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use ash::khr::swapchain::Device as SwapchainLoader;
 use ash::vk;
 
-use crate::device::{self, Device};
+use crate::device::Device;
 use crate::error::{GfxHalError, Result};
-use crate::surface::{self, Surface};
+use crate::surface::Surface;
 use crate::sync::{Fence, Semaphore};
 
 /// Configuration for creating or recreating a `Swapchain`.

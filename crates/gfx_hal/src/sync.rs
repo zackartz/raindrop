@@ -33,6 +33,11 @@ impl Fence {
         Ok(Self { device, fence })
     }
 
+    /// Returns the device used by the fence.
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
     /// Waits for the fence to become signaled.
     ///
     /// # Arguments

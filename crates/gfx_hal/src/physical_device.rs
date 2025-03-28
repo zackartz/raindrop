@@ -2,7 +2,7 @@ use ash::vk;
 
 use crate::{error::GfxHalError, instance::Instance};
 
-use std::{ffi::CStr, sync::Arc};
+use std::sync::Arc;
 
 /// Represents a physical Vulkan device (GPU).
 ///
@@ -21,7 +21,7 @@ pub struct PhysicalDevice {
 }
 
 /// Holds information about queue families found on a `PhysicalDevice`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueueFamilyIndices {
     /// Queue family index supporting graphics operations.
     pub graphics_family: Option<u32>,
@@ -100,16 +100,23 @@ impl PhysicalDevice {
     ) -> (
         vk::PhysicalDeviceFeatures,
         vk::PhysicalDeviceMeshShaderFeaturesEXT,
+        vk::PhysicalDeviceDynamicRenderingFeatures,
     ) {
         let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
-        let mut features2 =
-            vk::PhysicalDeviceFeatures2::default().push_next(&mut mesh_shader_features);
+        let mut dynamic_rendering_features = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut mesh_shader_features)
+            .push_next(&mut dynamic_rendering_features);
 
         self.instance
             .ash_instance()
             .get_physical_device_features2(self.handle, &mut features2);
 
-        (features2.features, mesh_shader_features)
+        (
+            features2.features,
+            mesh_shader_features,
+            dynamic_rendering_features,
+        )
     }
 
     /// Queries the properties of all queue families available on the device.

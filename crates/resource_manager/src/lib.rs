@@ -427,6 +427,7 @@ impl ResourceManager {
         &self,
         create_info: &vk::ImageCreateInfo, // User provides image details
         location: MemoryLocation,
+        aspect_flags: vk::ImageAspectFlags,
     ) -> Result<ImageHandle> {
         trace!(
             "Creating image: format={:?}, extent={:?}, usage={:?}, location={:?}",
@@ -465,7 +466,7 @@ impl ResourceManager {
             .view_type(vk::ImageViewType::TYPE_2D) // Assuming 2D, adjust based on create_info
             .format(create_info.format)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR, // Assuming color, adjust based on usage
+                aspect_mask: aspect_flags,
                 base_mip_level: 0,
                 level_count: create_info.mip_levels,
                 base_array_layer: 0,

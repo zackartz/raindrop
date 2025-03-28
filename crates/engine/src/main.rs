@@ -1,9 +1,9 @@
 use std::{
     error::Error,
-    ffi::{CStr, CString},
+    ffi::{c_char, CStr, CString},
     fs::OpenOptions,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use ash::vk;
@@ -11,23 +11,20 @@ use gfx_hal::{
     device::Device, error::GfxHalError, instance::Instance, instance::InstanceConfig,
     physical_device::PhysicalDevice, queue::Queue, surface::Surface,
 };
-use raw_window_handle::HasDisplayHandle;
+use raw_window_handle::{HasDisplayHandle, HasRawDisplayHandle};
 use renderer::{Renderer, RendererError};
 use resource_manager::{ResourceManager, ResourceManagerError};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use winit::{
+    application::ApplicationHandler,
     event::{Event, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowAttributes},
 };
-
 // --- Configuration ---
-const WINDOW_TITLE: &str = "Rust Vulkan Egui Engine";
-const INITIAL_WIDTH: u32 = 1280;
-const INITIAL_HEIGHT: u32 = 720;
-const APP_NAME: &str = "My App";
-const ENGINE_NAME: &str = "My Engine";
+const APP_NAME: &str = "BeginDisregard";
+const ENGINE_NAME: &str = "Engine";
 
 // --- Error Handling ---
 #[derive(Debug, thiserror::Error)]
@@ -50,14 +47,12 @@ enum AppError {
     MissingExtension(String),
 }
 
-// --- Main Application Structure ---
 struct Application {
-    // Core Vulkan Objects (managed by gfx_hal)
     _instance: Arc<Instance>,         // Keep instance alive
     _physical_device: PhysicalDevice, // Keep info, though Device holds handle
     device: Arc<Device>,
-    graphics_queue: Arc<Queue>,
-    surface: Arc<Surface>,
+    _graphics_queue: Arc<Queue>,
+    _surface: Arc<Surface>,
 
     // Resource Management
     resource_manager: Arc<ResourceManager>,
@@ -68,9 +63,39 @@ struct Application {
     // Windowing
     window: Arc<Window>, // Use Arc for potential multi-threading later
 
-    // State
+    frame_count: u32,
+    last_fps_update_time: Instant,
     last_frame_time: Instant,
-    ui_show_demo: bool,
+}
+
+#[derive(Default)]
+struct ApplicationWrapper {
+    app: Option<Application>,
+}
+
+impl ApplicationHandler for ApplicationWrapper {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title(format!("{} - {}", ENGINE_NAME, APP_NAME,)),
+                )
+                .expect("Windows to be able to be created"),
+        );
+        self.app = Some(Application::new(window).expect("Unable to create the Application."));
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let Some(app) = &mut self.app {
+            app.handle_event(&event, event_loop);
+        }
+    }
 }
 
 impl Application {
@@ -78,20 +103,25 @@ impl Application {
         info!("Initializing Application...");
 
         // --- 1. gfx_hal Setup ---
-        let instance_extensions = [
-            // Add extensions required by the platform (e.g., from winit)
-            // ash::extensions::ext::DebugUtils::name(), // If using validation
-            ash::khr::surface::NAME,
-            // Platform specific (example for Xlib/Wayland)
-            #[cfg(target_os = "linux")]
-            ash::khr::xlib_surface::NAME,
-            #[cfg(target_os = "linux")]
-            ash::khr::wayland_surface::NAME,
-            // Add other platform extensions as needed (Win32, Metal, etc.)
-        ];
+        let instance_extensions =
+            ash_window::enumerate_required_extensions(window.display_handle().unwrap().into())
+                .unwrap();
+
         let instance_extensions_c: Vec<CString> = instance_extensions
             .iter()
-            .map(|&s| CString::new(s.to_bytes()).unwrap())
+            .map(|&ptr| {
+                // Safety: We are trusting that the pointers returned by
+                // ash_window::enumerate_required_extensions are valid, non-null,
+                // null-terminated C strings. This is a standard assumption when
+                // working with C APIs via FFI.
+                unsafe {
+                    // 1. Create a borrowed CStr reference from the raw pointer.
+                    let c_str = CStr::from_ptr(ptr as *const c_char); // Cast is optional but common
+
+                    // 2. Convert the borrowed CStr into an owned CString.
+                    c_str.to_owned()
+                }
+            })
             .collect();
 
         let instance_config = InstanceConfig {
@@ -137,7 +167,6 @@ impl Application {
                     &pd,
                     &surface,
                     &required_device_extensions_cstr,
-                    &required_dynamic_rendering_features,
                 ) {
                     Ok(indices) => Some((pd, indices)),
                     Err(e) => {
@@ -238,66 +267,67 @@ impl Application {
             _instance: instance,
             _physical_device: physical_device,
             device,
-            graphics_queue,
-            surface,
+            _graphics_queue: graphics_queue,
+            _surface: surface,
             resource_manager,
             renderer,
             window,
+            frame_count: 0,
+            last_fps_update_time: Instant::now(),
             last_frame_time: Instant::now(),
-            ui_show_demo: true,
         })
     }
 
-    fn handle_event(&mut self, event: &Event<()>, active_event_loop: &ActiveEventLoop) {
+    fn handle_event(&mut self, event: &WindowEvent, active_event_loop: &ActiveEventLoop) {
         match event {
-            Event::WindowEvent { event, window_id } if *window_id == self.window.id() => {
-                match event {
-                    WindowEvent::CloseRequested => {
-                        info!("Close requested. Exiting...");
-                        active_event_loop.exit();
-                    }
-                    WindowEvent::Resized(physical_size) => {
-                        info!(
-                            "Window resized to: {}x{}",
-                            physical_size.width, physical_size.height
-                        );
-                        // Important: Resize renderer *before* the next frame
-                        self.renderer
-                            .resize(physical_size.width, physical_size.height);
-                        // Egui also needs the new screen descriptor info, though
-                        // egui_winit_state might handle this internally via on_window_event.
-                        // Explicitly setting it might be safer depending on version.
-                        // self.egui_winit_state.set_max_size_points(...) // If needed
-                    }
-                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                        info!("Scale factor changed: {}", scale_factor);
-                        // May also need to resize renderer if size depends on scale factor
-                        let new_inner_size = self.window.inner_size();
-                        self.renderer
-                            .resize(new_inner_size.width, new_inner_size.height);
-                    }
-                    // Handle other inputs if not consumed by egui
-                    WindowEvent::KeyboardInput { .. }
-                    | WindowEvent::CursorMoved { .. }
-                    | WindowEvent::MouseInput { .. } => {}
-                    _ => {}
-                }
+            WindowEvent::CloseRequested => {
+                info!("Close requested. Exiting...");
+                active_event_loop.exit();
             }
-            // Event::MainEventsCleared => { // Use AboutToWait for newer winit
-            //     // Application update code.
-            //     self.window.request_redraw();
-            // }
-            Event::AboutToWait => {
-                // Application update code and redraw request.
-                // This is the main place to prepare and trigger rendering.
+            WindowEvent::Resized(physical_size) => {
+                info!(
+                    "Window resized to: {}x{}",
+                    physical_size.width, physical_size.height
+                );
+                // Important: Resize renderer *before* the next frame
+                self.renderer
+                    .resize(physical_size.width, physical_size.height);
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                info!("Scale factor changed: {}", scale_factor);
+                // May also need to resize renderer if size depends on scale factor
+                let new_inner_size = self.window.inner_size();
+                self.renderer
+                    .resize(new_inner_size.width, new_inner_size.height);
+            }
+            // Handle other inputs if not consumed by egui
+            WindowEvent::KeyboardInput { .. }
+            | WindowEvent::CursorMoved { .. }
+            | WindowEvent::MouseInput { .. } => {}
 
+            WindowEvent::RedrawRequested => {
                 let now = Instant::now();
                 let _delta_time = now.duration_since(self.last_frame_time);
                 self.last_frame_time = now;
 
+                let elapsed_sice_last_update = now.duration_since(self.last_fps_update_time);
+                self.frame_count += 1;
+
+                if elapsed_sice_last_update >= Duration::from_secs(1) {
+                    let fps = self.frame_count as f64 / elapsed_sice_last_update.as_secs_f64();
+
+                    let new_title = format!("{} - {} - {:.0} FPS", ENGINE_NAME, APP_NAME, fps);
+                    self.window.set_title(&new_title);
+
+                    self.frame_count = 0;
+                    self.last_fps_update_time = now;
+                }
+
                 // --- Render Frame ---
                 match self.renderer.render_frame() {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        self.window.request_redraw();
+                    }
                     Err(RendererError::SwapchainSuboptimal) => {
                         // Swapchain is suboptimal, recreate it next frame by triggering resize
                         warn!("Swapchain suboptimal, forcing resize.");
@@ -310,14 +340,8 @@ impl Application {
                         active_event_loop.exit();
                     }
                 }
-            }
-            Event::LoopExiting => {
-                info!("Event loop exiting. Cleaning up...");
-                // Wait for GPU to finish before dropping resources
-                if let Err(e) = self.device.wait_idle() {
-                    error!("Error waiting for device idle on exit: {}", e);
-                }
-                info!("GPU idle. Cleanup complete.");
+
+                self.window.as_ref().request_redraw();
             }
             _ => {}
         }
@@ -331,7 +355,6 @@ fn find_suitable_device_and_queues(
     physical_device: &PhysicalDevice,
     surface: &Surface,
     required_extensions: &[&CStr],
-    required_dynamic_rendering_features: &vk::PhysicalDeviceDynamicRenderingFeaturesKHR,
 ) -> Result<gfx_hal::physical_device::QueueFamilyIndices, Box<dyn Error>> {
     // 1. Check Extension Support
     let supported_extensions = unsafe {
@@ -425,7 +448,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_ansi(true)
         .with_file(false)
         .with_line_number(false)
-        .without_time();
+        .with_filter(filter::LevelFilter::DEBUG);
 
     let log_file = OpenOptions::new()
         .append(true)
@@ -433,9 +456,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .open("log-debug.log")?;
 
     let json_layer = tracing_subscriber::fmt::layer()
-        .json()
+        .with_ansi(false)
+        .without_time()
         .with_writer(log_file)
-        .with_filter(filter::LevelFilter::TRACE);
+        .with_filter(filter::LevelFilter::DEBUG);
 
     tracing_subscriber::registry()
         .with(fmt_layer)
@@ -444,19 +468,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // --- Winit Setup ---
     let event_loop = EventLoop::new()?;
-    let window = Arc::new(event_loop.create_window(WindowAttributes::default())?);
-
-    info!("Window created.");
-
-    // --- Application Setup ---
-    let mut app = Application::new(window.clone())?;
 
     // --- Event Loop ---
     info!("Starting event loop...");
-    event_loop.run(move |event, elwt| {
-        // elwt is EventLoopWindowTarget, not needed directly here often
-        app.handle_event(&event, elwt);
-    })?;
+    let mut app = ApplicationWrapper::default();
+    event_loop.run_app(&mut app)?;
 
     Ok(())
 }

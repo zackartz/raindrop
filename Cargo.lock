@@ -412,6 +412,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "ash-window",
  "egui",
  "gfx_hal",
  "raw-window-handle",

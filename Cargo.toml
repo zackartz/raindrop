@@ -12,7 +12,7 @@ members = [
 ash = { version = "0.38" }
 ash-window = "0.13.0"
 color-eyre = "0.6.3"
-winit = { version = "0.30.7", features = ["rwh_06"] }
+winit = { version = "0.30.9", features = ["rwh_06"] }
 raw-window-handle = "0.6"
 gpu-allocator = { version = "0.27.0", features = ["vulkan"] }
 glam = { version = "0.22", default-features = false, features = [

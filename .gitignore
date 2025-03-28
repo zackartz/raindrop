@@ -2,3 +2,4 @@
 sponza/
 .direnv/
 shader-cache/
+log-debug.log

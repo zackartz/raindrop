@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use resource_manager::{ImageHandle, ResourceManager, ResourceManagerError};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
- // Assuming winit is used by the app
+// Assuming winit is used by the app
 
 // Re-export ash for convenience if needed elsewhere
 pub use ash;
@@ -179,16 +179,17 @@ impl Renderer {
         frame_data.in_flight_fence.wait(None)?; // Wait indefinitely
 
         // --- Acquire Swapchain Image ---
+        let swapchain_ref = self
+            .swapchain
+            .as_ref()
+            .ok_or(RendererError::SwapchainAcquisitionFailed)?;
         let (image_index, suboptimal) = unsafe {
             // Need unsafe block for acquire_next_image
-            self.swapchain
-                .as_ref()
-                .ok_or(RendererError::SwapchainAcquisitionFailed)? // Should exist
-                .acquire_next_image(
-                    u64::MAX, // Timeout
-                    Some(&frame_data.image_available_semaphore),
-                    None, // Don't need a fence here
-                )?
+            swapchain_ref.acquire_next_image(
+                u64::MAX, // Timeout
+                Some(&frame_data.image_available_semaphore),
+                None, // Don't need a fence here
+            )?
         };
 
         if suboptimal {
@@ -221,10 +222,40 @@ impl Renderer {
                 .begin_command_buffer(command_buffer, &cmd_begin_info)?;
         }
 
+        let current_swapchain_image = swapchain_ref.images()[image_index as usize];
+
+        let initial_layout_transition_barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty()) // No need to wait for writes from previous frame/present
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE) // Will be written as attachment
+            .old_layout(vk::ImageLayout::UNDEFINED) // Assume undefined or present_src; UNDEFINED is safer
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL) // Layout needed for rendering
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(current_swapchain_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        unsafe {
+            self.device.raw().cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE, // Source stage (nothing before this)
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, // Destination stage (where write happens)
+                vk::DependencyFlags::empty(),
+                &[],                                  // No memory barriers
+                &[],                                  // No buffer memory barriers
+                &[initial_layout_transition_barrier], // The image barrier
+            );
+        }
+
         // --- Dynamic Rendering Setup ---
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.swapchain_image_views[image_index as usize])
-            .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
@@ -303,6 +334,36 @@ impl Renderer {
             self.device.raw().cmd_end_rendering(command_buffer);
         }
 
+        let current_swapchain_image = swapchain_ref.images()[image_index as usize];
+
+        let layout_transition_barrier = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::empty())
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(current_swapchain_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+
+        unsafe {
+            self.device.raw().cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[layout_transition_barrier],
+            );
+        }
+
         // --- End Command Buffer ---
         unsafe {
             // Need unsafe for Vulkan commands
@@ -347,9 +408,7 @@ impl Renderer {
 
         let suboptimal_present = unsafe {
             // Need unsafe for queue_present
-            self.swapchain
-                .as_ref()
-                .unwrap() // Safe unwrap
+            swapchain_ref
                 .loader()
                 .queue_present(self.graphics_queue.handle(), &present_info)
                 .map_err(|e| {
@@ -536,7 +595,11 @@ impl Renderer {
             .samples(vk::SampleCountFlags::TYPE_1)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let handle = resource_manager.create_image(&image_create_info, MemoryLocation::GpuOnly)?;
+        let handle = resource_manager.create_image(
+            &image_create_info,
+            MemoryLocation::GpuOnly,
+            vk::ImageAspectFlags::DEPTH,
+        )?;
 
         // Get the vk::Image handle to create the view
         let image_info = resource_manager.get_image_info(handle)?;

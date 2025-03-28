@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 egui.workspace = true
 ash.workspace = true
+ash-window.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true

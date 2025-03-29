@@ -16,3 +16,4 @@ thiserror.workspace = true
 gfx_hal = { path = "../gfx_hal" }
 renderer = { path = "../renderer" }
 resource_manager = { path = "../resource_manager" }
+clap = { version = "4.5.34", features = ["derive"] }

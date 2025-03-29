@@ -7,20 +7,21 @@ use std::{
 };
 
 use ash::vk;
+use clap::Parser;
 use gfx_hal::{
     device::Device, error::GfxHalError, instance::Instance, instance::InstanceConfig,
     physical_device::PhysicalDevice, queue::Queue, surface::Surface,
 };
-use raw_window_handle::{HasDisplayHandle, HasRawDisplayHandle};
+use raw_window_handle::HasDisplayHandle;
 use renderer::{Renderer, RendererError};
 use resource_manager::{ResourceManager, ResourceManagerError};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use winit::{
     application::ApplicationHandler,
-    event::{Event, WindowEvent},
+    event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowAttributes},
+    window::Window,
 };
 // --- Configuration ---
 const APP_NAME: &str = "BeginDisregard";
@@ -39,23 +40,19 @@ enum AppError {
     Renderer(#[from] RendererError),
     #[error("Suitable physical device not found")]
     NoSuitableDevice,
-    #[error("Required queue family not found")]
-    NoSuitableQueueFamily,
     #[error("Failed to create CString: {0}")]
     NulError(#[from] std::ffi::NulError),
-    #[error("Missing required Vulkan extension: {0}")]
-    MissingExtension(String),
 }
 
 struct Application {
     _instance: Arc<Instance>,         // Keep instance alive
     _physical_device: PhysicalDevice, // Keep info, though Device holds handle
-    device: Arc<Device>,
+    _device: Arc<Device>,
     _graphics_queue: Arc<Queue>,
     _surface: Arc<Surface>,
 
     // Resource Management
-    resource_manager: Arc<ResourceManager>,
+    _resource_manager: Arc<ResourceManager>,
 
     // Renderer
     renderer: Renderer,
@@ -266,10 +263,10 @@ impl Application {
         Ok(Self {
             _instance: instance,
             _physical_device: physical_device,
-            device,
+            _device: device,
             _graphics_queue: graphics_queue,
             _surface: surface,
-            resource_manager,
+            _resource_manager: resource_manager,
             renderer,
             window,
             frame_count: 0,
@@ -442,29 +439,43 @@ fn find_suitable_device_and_queues(
     }
 }
 
+/// Game Engine
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Whether or not to create debug log (default false)
+    #[arg(short, long, default_value_t = false)]
+    debug_log: bool,
+}
+
 // --- Entry Point ---
 fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
+
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(true)
         .with_file(false)
         .with_line_number(false)
         .with_filter(filter::LevelFilter::DEBUG);
 
-    let log_file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open("log-debug.log")?;
+    let registry = tracing_subscriber::registry().with(fmt_layer);
 
-    let json_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(log_file)
-        .with_filter(filter::LevelFilter::DEBUG);
+    if args.debug_log {
+        let log_file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("log-debug.log")?;
 
-    tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(json_layer)
-        .init();
+        let json_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log_file)
+            .with_filter(filter::LevelFilter::DEBUG);
+
+        registry.with(json_layer).init();
+    } else {
+        registry.init();
+    }
 
     // --- Winit Setup ---
     let event_loop = EventLoop::new()?;

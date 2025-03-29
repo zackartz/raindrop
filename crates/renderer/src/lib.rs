@@ -465,10 +465,6 @@ impl Renderer {
         self.depth_image_handle = new_depth_handle;
         self.depth_image_view = new_depth_view;
 
-        // 4. Update Egui Renderer (if necessary, depends on its implementation)
-        // It might need the new extent or recreate internal resources.
-        // Assuming it handles extent changes via update_screen_descriptor called earlier.
-
         info!(
             "Swapchain recreated successfully ({}x{}).",
             new_extent.width, new_extent.height

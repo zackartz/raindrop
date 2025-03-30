@@ -613,7 +613,6 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
- "parking_lot",
  "thiserror 2.0.12",
  "tracing",
  "winit",
@@ -1308,7 +1307,6 @@ dependencies = [
  "gfx_hal",
  "glam",
  "gpu-allocator",
- "parking_lot",
  "resource_manager",
  "shaderc",
  "thiserror 2.0.12",
@@ -1324,7 +1322,6 @@ dependencies = [
  "ash",
  "gfx_hal",
  "gpu-allocator",
- "parking_lot",
  "thiserror 2.0.12",
  "tracing",
 ]

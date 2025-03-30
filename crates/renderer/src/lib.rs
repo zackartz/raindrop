@@ -1,12 +1,15 @@
-use std::{ffi::CStr, sync::Arc};
+use std::{
+    ffi::CStr,
+    sync::{Arc, Mutex},
+};
 
 use ash::vk;
+use egui_ash_renderer::{DynamicRendering, Options, Renderer as EguiRenderer};
 use gfx_hal::{
     device::Device, error::GfxHalError, queue::Queue, surface::Surface, swapchain::Swapchain,
     swapchain::SwapchainConfig, sync::Fence, sync::Semaphore,
 };
 use gpu_allocator::{vulkan::Allocator, MemoryLocation};
-use parking_lot::Mutex;
 use resource_manager::{ImageHandle, ResourceManager, ResourceManagerError};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -79,6 +82,8 @@ pub struct Renderer {
     swapchain_format: vk::SurfaceFormatKHR,
     swapchain_extent: vk::Extent2D,
 
+    egui_renderer: EguiRenderer,
+
     depth_image_handle: ImageHandle,
     depth_image_view: vk::ImageView, // Store the view directly
     depth_format: vk::Format,
@@ -128,10 +133,21 @@ impl Renderer {
 
         info!("Renderer initialized successfully.");
 
+        let egui_renderer = EguiRenderer::with_gpu_allocator(
+            resource_manager.allocator(),
+            device.raw().clone(),
+            DynamicRendering {
+                color_attachment_format: swapchain.format().format,
+                depth_attachment_format: Some(depth_format),
+            },
+            Options::default(),
+        )?;
+
         Ok(Self {
             device,
             graphics_queue,
             resource_manager,
+            egui_renderer,
             allocator, // Store the allocator Arc
             surface,
             swapchain: Some(swapchain),
@@ -464,6 +480,10 @@ impl Renderer {
         self.swapchain_image_views = new_image_views;
         self.depth_image_handle = new_depth_handle;
         self.depth_image_view = new_depth_view;
+
+        // 4. Update Egui Renderer (if necessary, depends on its implementation)
+        // It might need the new extent or recreate internal resources.
+        // Assuming it handles extent changes via update_screen_descriptor called earlier.
 
         info!(
             "Swapchain recreated successfully ({}x{}).",

@@ -56,9 +56,19 @@ pub enum GfxHalError {
     #[error("Error loading the ash entry.")]
     AshEntryError(#[from] ash::LoadingError),
 
+    /// Poisoned Mutex
+    #[error("Error from poisoned mutex: {0}")]
+    MutexPoisoned(String),
+
     /// Placeholder for other specific errors.
     #[error("An unexpected error occurred: {0}")]
     Other(String),
 }
 
 pub type Result<T, E = GfxHalError> = std::result::Result<T, E>;
+
+impl<T> From<std::sync::PoisonError<T>> for GfxHalError {
+    fn from(e: std::sync::PoisonError<T>) -> Self {
+        Self::MutexPoisoned(e.to_string())
+    }
+}

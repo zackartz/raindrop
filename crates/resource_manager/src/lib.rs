@@ -5,7 +5,7 @@ use std::{
     hash::Hash,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -18,7 +18,6 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc, Allocator, AllocatorCreateDesc},
     MemoryLocation,
 };
-use parking_lot::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferHandle(u64);
@@ -63,7 +62,7 @@ impl Drop for InternalBufferInfo {
     fn drop(&mut self) {
         trace!("Dropping InternalBufferInfo for handle: {:?}", self.handle);
         if let Some(allocation) = self.allocation.take() {
-            let mut allc = self.allocator.lock();
+            let mut allc = self.allocator.lock().expect("to acquire mutex lock");
             if let Err(e) = allc.free(allocation) {
                 error!(
                     "Failed to free allocation for buffer handle {:?}, {}",
@@ -102,7 +101,7 @@ impl Drop for InternalImageInfo {
         }
         // Then free memory
         if let Some(allocation) = self.allocation.take() {
-            let mut allocator = self.allocator.lock();
+            let mut allocator = self.allocator.lock().expect("to acquire mutex lock");
             if let Err(e) = allocator.free(allocation) {
                 error!(
                     "Failed to free allocation for image handle {:?}: {}",
@@ -171,7 +170,7 @@ impl ResourceManager {
 
     /// Gets or initializes the TransferSetup resources.
     fn get_transfer_setup(&self) -> Result<TransferSetup> {
-        let mut setup_guard = self.transfer_setup.lock();
+        let mut setup_guard = self.transfer_setup.lock()?;
 
         if let Some(setup) = setup_guard.as_ref() {
             // Simple check: Reset fence before reusing
@@ -192,10 +191,7 @@ impl ResourceManager {
             .or(self.device.compute_queue_family_index()) // Try compute as fallback
             .unwrap_or(self.device.graphics_queue_family_index()); // Graphics as last resort
 
-        let queue = self
-            .device
-            .get_queue(queue_family_index, 0)
-            .ok_or(ResourceManagerError::NoTransferQueue)?;
+        let queue = self.device.get_queue(queue_family_index, 0)?;
 
         // Create command pool for transfer commands
         let pool_info = vk::CommandPoolCreateInfo::default()
@@ -306,7 +302,7 @@ impl ResourceManager {
 
         let requirements = unsafe { self.device.raw().get_buffer_memory_requirements(buffer) };
 
-        let allocation = self.allocator.lock().allocate(&AllocationCreateDesc {
+        let allocation = self.allocator.lock()?.allocate(&AllocationCreateDesc {
             name: &format!("buffer_usage_{:?}_loc_{:?}", usage, location),
             requirements,
             location,
@@ -342,7 +338,7 @@ impl ResourceManager {
             handle,
         };
 
-        self.buffers.lock().insert(id, internal_info);
+        self.buffers.lock()?.insert(id, internal_info);
         debug!("Buffer created successfully: handle={:?}", handle);
         Ok(handle)
     }
@@ -441,7 +437,7 @@ impl ResourceManager {
 
         let requirements = unsafe { self.device.raw().get_image_memory_requirements(image) };
 
-        let allocation = self.allocator.lock().allocate(&AllocationCreateDesc {
+        let allocation = self.allocator.lock()?.allocate(&AllocationCreateDesc {
             name: &format!(
                 "image_fmt_{:?}_usage_{:?}",
                 create_info.format, create_info.usage
@@ -491,7 +487,7 @@ impl ResourceManager {
             handle,
         };
 
-        self.images.lock().insert(id, internal_info);
+        self.images.lock()?.insert(id, internal_info);
         debug!("Image created successfully: handle={:?}", handle);
         Ok(handle)
     }
@@ -501,7 +497,7 @@ impl ResourceManager {
     /// Destroys a buffer and frees its memory.
     pub fn destroy_buffer(&self, handle: BufferHandle) -> Result<()> {
         debug!("Requesting destroy for buffer handle {:?}", handle);
-        let mut buffers_map = self.buffers.lock();
+        let mut buffers_map = self.buffers.lock()?;
         // Remove the entry. The Drop impl of InternalBufferInfo handles the cleanup.
         if buffers_map.remove(&handle.0).is_some() {
             debug!("Buffer handle {:?} removed for destruction.", handle);
@@ -518,7 +514,7 @@ impl ResourceManager {
     /// Destroys an image, its view, and frees its memory.
     pub fn destroy_image(&self, handle: ImageHandle) -> Result<()> {
         debug!("Requesting destroy for image handle {:?}", handle);
-        let mut images_map = self.images.lock();
+        let mut images_map = self.images.lock()?;
         // Remove the entry. The Drop impl of InternalImageInfo handles the cleanup.
         if images_map.remove(&handle.0).is_some() {
             debug!("Image handle {:?} removed for destruction.", handle);
@@ -534,7 +530,7 @@ impl ResourceManager {
 
     /// Gets non-owning information about a buffer.
     pub fn get_buffer_info(&self, handle: BufferHandle) -> Result<BufferInfo> {
-        let buffers_map = self.buffers.lock();
+        let buffers_map = self.buffers.lock()?;
         buffers_map
             .get(&handle.0)
             .map(|internal| BufferInfo {
@@ -549,7 +545,7 @@ impl ResourceManager {
 
     /// Gets non-owning information about an image.
     pub fn get_image_info(&self, handle: ImageHandle) -> Result<ImageInfo> {
-        let images_map = self.images.lock();
+        let images_map = self.images.lock()?;
         images_map
             .get(&handle.0)
             .map(|internal| ImageInfo {
@@ -586,15 +582,18 @@ impl Drop for ResourceManager {
 
         // Clear resource maps. This triggers the Drop impl for each Internal*Info,
         // which frees allocations and destroys Vulkan objects.
-        let mut buffers_map = self.buffers.lock();
+        let mut buffers_map = self.buffers.lock().expect("mutex to not be poisoned");
         debug!("Clearing {} buffer entries...", buffers_map.len());
         buffers_map.clear();
-        let mut images_map = self.images.lock();
+        let mut images_map = self.images.lock().expect("mutex to not be poisoned");
         debug!("Clearing {} image entries...", images_map.len());
         images_map.clear();
 
         // Destroy transfer setup resources
-        let mut setup_guard = self.transfer_setup.lock();
+        let mut setup_guard = self
+            .transfer_setup
+            .lock()
+            .expect("mutex to not be poisoned");
         if let Some(setup) = setup_guard.take() {
             // take() removes it from the Option
             debug!("Destroying TransferSetup resources...");

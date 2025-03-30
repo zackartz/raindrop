@@ -1,9 +1,10 @@
 use ash::vk;
-use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::ffi::CStr;
-use std::sync::Weak;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::error::{GfxHalError, Result};
 use crate::instance::Instance;
@@ -146,7 +147,7 @@ impl Device {
         // Lock the mutex and insert the created queues into the map within the Arc<Device>
         {
             // Scope for the mutex guard
-            let mut queues_map_guard = device_arc.queues.lock();
+            let mut queues_map_guard = device_arc.queues.lock()?;
             *queues_map_guard = queues_to_insert; // Replace the empty map with the populated one
             tracing::debug!(
                 "Device Arc populated with {} queues (Stage 2).",
@@ -185,15 +186,21 @@ impl Device {
 
     /// Gets a wrapped queue handle.
     /// Currently only supports queue index 0 for each family.
-    pub fn get_queue(&self, family_index: u32, queue_index: u32) -> Option<Arc<Queue>> {
+    pub fn get_queue(&self, family_index: u32, queue_index: u32) -> Result<Arc<Queue>> {
         if queue_index != 0 {
             tracing::warn!("get_queue currently only supports queue_index 0");
-            return None;
+            return Err(GfxHalError::MissingQueueFamily(
+                "get_queue only supports queue_index 0".to_string(),
+            ));
         }
+
         self.queues
-            .lock()
+            .lock()?
             .get(&(family_index, queue_index))
             .cloned()
+            .ok_or(GfxHalError::MissingQueueFamily(
+                "could not get queue family".to_string(),
+            ))
     }
 
     /// Gets the primary graphics queue (family index from `graphics_queue_family_index`, queue index 0).

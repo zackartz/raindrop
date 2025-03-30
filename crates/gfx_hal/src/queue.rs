@@ -1,7 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ash::{vk, Device as AshDevice};
-use parking_lot::Mutex;
 
 use crate::device::Device;
 use crate::error::Result;

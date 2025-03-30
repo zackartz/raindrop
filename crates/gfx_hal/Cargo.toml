@@ -9,4 +9,3 @@ ash-window.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 winit.workspace = true
-parking_lot.workspace = true

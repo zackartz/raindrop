@@ -4,6 +4,7 @@ use std::{
 };
 
 use ash::vk;
+use egui::{ClippedPrimitive, TextureId, TexturesDelta};
 use egui_ash_renderer::{DynamicRendering, Options, Renderer as EguiRenderer};
 use gfx_hal::{
     device::Device, error::GfxHalError, queue::Queue, surface::Surface, swapchain::Swapchain,
@@ -61,6 +62,7 @@ struct FrameData {
     command_buffer: vk::CommandBuffer,
     image_available_semaphore: Semaphore,
     render_finished_semaphore: Semaphore,
+    textures_to_free: Option<Vec<TextureId>>,
     in_flight_fence: Fence,
 }
 
@@ -140,7 +142,10 @@ impl Renderer {
                 color_attachment_format: swapchain.format().format,
                 depth_attachment_format: Some(depth_format),
             },
-            Options::default(),
+            Options {
+                srgb_framebuffer: true,
+                ..Default::default()
+            },
         )?;
 
         Ok(Self {
@@ -178,7 +183,12 @@ impl Renderer {
         }
     }
 
-    pub fn render_frame(&mut self) -> Result<(), RendererError> {
+    pub fn render_frame(
+        &mut self,
+        pixels_per_point: f32,
+        textures_delta: TexturesDelta,
+        clipped_primitives: &[ClippedPrimitive],
+    ) -> Result<(), RendererError> {
         // --- Handle Resize ---
         if self.window_resized {
             self.window_resized = false;
@@ -190,7 +200,7 @@ impl Renderer {
 
         // --- Wait for Previous Frame ---
         let frame_index = self.current_frame;
-        let frame_data = &self.frames_data[frame_index];
+        let frame_data = &mut self.frames_data[frame_index];
 
         frame_data.in_flight_fence.wait(None)?; // Wait indefinitely
 
@@ -219,6 +229,11 @@ impl Renderer {
         // --- Reset Fence (only after successful acquisition) ---
         frame_data.in_flight_fence.reset()?;
 
+        if let Some(textures) = frame_data.textures_to_free.take() {
+            tracing::debug!("Freeing EGUI Textures");
+            self.egui_renderer.free_textures(&textures)?;
+        }
+
         // --- Record Command Buffer ---
         unsafe {
             // Need unsafe for Vulkan commands
@@ -237,6 +252,29 @@ impl Renderer {
                 .raw()
                 .begin_command_buffer(command_buffer, &cmd_begin_info)?;
         }
+
+        if !textures_delta.free.is_empty() {
+            tracing::debug!("Setting textures to free");
+            frame_data.textures_to_free = Some(textures_delta.free.clone());
+        }
+
+        if !textures_delta.set.is_empty() {
+            tracing::trace!("Setting EGUI textures");
+            self.egui_renderer.set_textures(
+                self.device.get_graphics_queue().handle(),
+                frame_data.command_pool,
+                textures_delta.set.as_slice(),
+            )?;
+        }
+
+        tracing::info!("Rendering EGUI");
+        self.egui_renderer.cmd_draw(
+            command_buffer,
+            self.swapchain_extent,
+            pixels_per_point,
+            clipped_primitives,
+        )?;
+        tracing::debug!("Rendered EGUI");
 
         let current_swapchain_image = swapchain_ref.images()[image_index as usize];
 
@@ -862,6 +900,7 @@ impl Renderer {
             };
 
             frames_data.push(FrameData {
+                textures_to_free: None,
                 command_pool,
                 command_buffer, // Stays allocated, just reset/rerecorded
                 image_available_semaphore,

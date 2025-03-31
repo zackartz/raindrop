@@ -7,7 +7,6 @@ edition = "2021"
 ash.workspace = true
 gpu-allocator.workspace = true
 thiserror.workspace = true
-parking_lot.workspace = true
 tracing.workspace = true
 
 gfx_hal = { path = "../gfx_hal" }

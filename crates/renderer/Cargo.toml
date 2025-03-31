@@ -13,7 +13,6 @@ gpu-allocator.workspace = true
 egui.workspace = true
 egui-ash-renderer.workspace = true
 winit.workspace = true
-parking_lot.workspace = true
 
 gfx_hal = { path = "../gfx_hal" }
 resource_manager = { path = "../resource_manager" }

@@ -342,8 +342,6 @@ impl Application {
 
                 let raw_input = self.egui_winit.take_egui_input(&self.window);
 
-                tracing::info!("{:?}", raw_input);
-
                 let egui::FullOutput {
                     platform_output,
                     textures_delta,

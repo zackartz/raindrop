@@ -183,10 +183,30 @@ impl Renderer {
         }
     }
 
+    pub fn update_textures(&mut self, textures_delta: TexturesDelta) -> Result<(), RendererError> {
+        tracing::trace!("Updating EGUI textures!");
+
+        if !textures_delta.free.is_empty() {
+            self.frames_data[self.current_frame].textures_to_free =
+                Some(textures_delta.free.clone());
+        }
+
+        if !textures_delta.set.is_empty() {
+            self.egui_renderer
+                .set_textures(
+                    self.device.get_graphics_queue().handle(),
+                    self.frames_data[self.current_frame].command_pool,
+                    textures_delta.set.as_slice(),
+                )
+                .expect("Failed to update texture");
+        }
+
+        Ok(())
+    }
+
     pub fn render_frame(
         &mut self,
         pixels_per_point: f32,
-        textures_delta: TexturesDelta,
         clipped_primitives: &[ClippedPrimitive],
     ) -> Result<(), RendererError> {
         // --- Handle Resize ---
@@ -252,29 +272,6 @@ impl Renderer {
                 .raw()
                 .begin_command_buffer(command_buffer, &cmd_begin_info)?;
         }
-
-        if !textures_delta.free.is_empty() {
-            tracing::debug!("Setting textures to free");
-            frame_data.textures_to_free = Some(textures_delta.free.clone());
-        }
-
-        if !textures_delta.set.is_empty() {
-            tracing::trace!("Setting EGUI textures");
-            self.egui_renderer.set_textures(
-                self.device.get_graphics_queue().handle(),
-                frame_data.command_pool,
-                textures_delta.set.as_slice(),
-            )?;
-        }
-
-        tracing::info!("Rendering EGUI");
-        self.egui_renderer.cmd_draw(
-            command_buffer,
-            self.swapchain_extent,
-            pixels_per_point,
-            clipped_primitives,
-        )?;
-        tracing::debug!("Rendered EGUI");
 
         let current_swapchain_image = swapchain_ref.images()[image_index as usize];
 
@@ -381,6 +378,15 @@ impl Renderer {
             // Draw 3 vertices, 1 instance, 0 first vertex, 0 first instance
             self.device.raw().cmd_draw(command_buffer, 3, 1, 0, 0);
         }
+
+        tracing::trace!("Rendering EGUI");
+        self.egui_renderer.cmd_draw(
+            command_buffer,
+            self.swapchain_extent,
+            pixels_per_point,
+            clipped_primitives,
+        )?;
+        tracing::trace!("Rendered EGUI");
 
         // --- End Dynamic Rendering ---
         unsafe {

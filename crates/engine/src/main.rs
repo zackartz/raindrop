@@ -294,6 +294,8 @@ impl Application {
     }
 
     fn handle_event(&mut self, event: &WindowEvent, active_event_loop: &ActiveEventLoop) {
+        let _ = self.egui_winit.on_window_event(&self.window, event);
+
         match event {
             WindowEvent::CloseRequested => {
                 info!("Close requested. Exiting...");
@@ -340,6 +342,8 @@ impl Application {
 
                 let raw_input = self.egui_winit.take_egui_input(&self.window);
 
+                tracing::info!("{:?}", raw_input);
+
                 let egui::FullOutput {
                     platform_output,
                     textures_delta,
@@ -350,17 +354,18 @@ impl Application {
                     self.egui_app.build_ui(ctx);
                 });
 
+                self.renderer.update_textures(textures_delta).unwrap();
+
                 self.egui_winit
                     .handle_platform_output(&self.window, platform_output);
 
                 let clipped_primitives = self.egui_ctx.tessellate(shapes, pixels_per_point);
 
                 // --- Render Frame ---
-                match self.renderer.render_frame(
-                    pixels_per_point,
-                    textures_delta,
-                    &clipped_primitives,
-                ) {
+                match self
+                    .renderer
+                    .render_frame(pixels_per_point, &clipped_primitives)
+                {
                     Ok(_) => {
                         self.window.request_redraw();
                     }

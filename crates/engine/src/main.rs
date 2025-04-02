@@ -8,6 +8,8 @@ use std::{
 
 use ash::vk;
 use clap::Parser;
+use egui::{Context, ViewportId};
+use egui_winit::State;
 use gfx_hal::{
     device::Device, error::GfxHalError, instance::Instance, instance::InstanceConfig,
     physical_device::PhysicalDevice, queue::Queue, surface::Surface,
@@ -57,12 +59,29 @@ struct Application {
     // Renderer
     renderer: Renderer,
 
+    egui_ctx: Context,
+    egui_winit: State,
+    egui_app: EditorUI,
+
     // Windowing
     window: Arc<Window>, // Use Arc for potential multi-threading later
 
     frame_count: u32,
     last_fps_update_time: Instant,
     last_frame_time: Instant,
+}
+
+#[derive(Default)]
+struct EditorUI {}
+
+impl EditorUI {
+    fn title() -> String {
+        "engine".to_string()
+    }
+
+    fn build_ui(&mut self, ctx: &egui::Context) {
+        egui::Window::new(Self::title()).show(ctx, |ui| ui.label(Self::title()));
+    }
 }
 
 #[derive(Default)]
@@ -223,14 +242,6 @@ impl Application {
         // Get specific queues (assuming graphics and present are the same for simplicity)
         let graphics_queue = device.get_graphics_queue();
         let queue_associated_device_handle = graphics_queue.device().raw().handle();
-        info!(
-            "App: Queue is associated with Device handle: {:?}",
-            queue_associated_device_handle
-        );
-        assert_eq!(
-            device_handle_at_creation, queue_associated_device_handle,
-            "Device handle mismatch immediately after queue creation!"
-        );
 
         // --- 4. Resource Manager ---
         let resource_manager = Arc::new(ResourceManager::new(instance.clone(), device.clone())?);
@@ -238,14 +249,6 @@ impl Application {
 
         let renderer_device_handle_to_pass = device.raw().handle();
         let renderer_queue_device_handle_to_pass = graphics_queue.device().raw().handle();
-        info!(
-            "App: Passing Device handle to Renderer: {:?}",
-            renderer_device_handle_to_pass
-        );
-        info!(
-            "App: Passing Queue associated with Device handle: {:?}",
-            renderer_queue_device_handle_to_pass
-        );
 
         // --- 5. Renderer ---
         let initial_size = window.inner_size();
@@ -258,6 +261,18 @@ impl Application {
             initial_size.width,
             initial_size.height,
         )?;
+
+        let egui_ctx = Context::default();
+        let egui_winit = State::new(
+            egui_ctx.clone(),
+            ViewportId::ROOT,
+            &window,
+            None,
+            None,
+            None,
+        );
+        let egui_app = EditorUI::default();
+
         info!("Renderer initialized.");
 
         Ok(Self {
@@ -269,6 +284,9 @@ impl Application {
             _resource_manager: resource_manager,
             renderer,
             window,
+            egui_winit,
+            egui_ctx,
+            egui_app,
             frame_count: 0,
             last_fps_update_time: Instant::now(),
             last_frame_time: Instant::now(),
@@ -276,6 +294,8 @@ impl Application {
     }
 
     fn handle_event(&mut self, event: &WindowEvent, active_event_loop: &ActiveEventLoop) {
+        let _ = self.egui_winit.on_window_event(&self.window, event);
+
         match event {
             WindowEvent::CloseRequested => {
                 info!("Close requested. Exiting...");
@@ -320,8 +340,30 @@ impl Application {
                     self.last_fps_update_time = now;
                 }
 
+                let raw_input = self.egui_winit.take_egui_input(&self.window);
+
+                let egui::FullOutput {
+                    platform_output,
+                    textures_delta,
+                    shapes,
+                    pixels_per_point,
+                    ..
+                } = self.egui_ctx.run(raw_input, |ctx| {
+                    self.egui_app.build_ui(ctx);
+                });
+
+                self.renderer.update_textures(textures_delta).unwrap();
+
+                self.egui_winit
+                    .handle_platform_output(&self.window, platform_output);
+
+                let clipped_primitives = self.egui_ctx.tessellate(shapes, pixels_per_point);
+
                 // --- Render Frame ---
-                match self.renderer.render_frame() {
+                match self
+                    .renderer
+                    .render_frame(pixels_per_point, &clipped_primitives)
+                {
                     Ok(_) => {
                         self.window.request_redraw();
                     }
@@ -450,6 +492,7 @@ struct Args {
 
 // --- Entry Point ---
 fn main() -> Result<(), Box<dyn Error>> {
+    color_eyre::install()?;
     let args = Args::parse();
 
     let fmt_layer = tracing_subscriber::fmt::layer()

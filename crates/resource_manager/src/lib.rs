@@ -1,4 +1,5 @@
 mod error;
+mod geo;
 
 use std::{
     collections::HashMap,
@@ -10,10 +11,12 @@ use std::{
 };
 
 use ash::vk;
-use gfx_hal::{device::Device, instance::Instance, queue::Queue};
+use gfx_hal::{device::Device, instance::Instance, queue::Queue, Fence};
 use tracing::{debug, error, trace, warn};
 
 pub use error::{ResourceManagerError, Result};
+pub use geo::Geometry;
+
 use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc, Allocator, AllocatorCreateDesc},
     MemoryLocation,
@@ -125,7 +128,7 @@ impl Drop for InternalImageInfo {
 struct TransferSetup {
     command_pool: vk::CommandPool,
     queue: Arc<Queue>,
-    fence: vk::Fence,
+    fence: Fence,
 }
 
 pub struct ResourceManager {
@@ -135,7 +138,7 @@ pub struct ResourceManager {
     buffers: Mutex<HashMap<u64, InternalBufferInfo>>,
     images: Mutex<HashMap<u64, InternalImageInfo>>,
     next_id: AtomicU64,
-    transfer_setup: Mutex<Option<TransferSetup>>,
+    transfer_setup: Arc<Mutex<TransferSetup>>,
 }
 
 impl ResourceManager {
@@ -152,6 +155,28 @@ impl ResourceManager {
         })?;
         debug!("GPU Allocator created.");
 
+        let queue_family_index = device
+            .transfer_queue_family_index()
+            .or(device.compute_queue_family_index()) // Try compute as fallback
+            .unwrap_or(device.graphics_queue_family_index()); // Graphics as last resort
+
+        let queue = device.get_queue(queue_family_index, 0)?;
+
+        // Create command pool for transfer commands
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::TRANSIENT) // Hint that buffers are short-lived
+            .queue_family_index(queue_family_index);
+        let command_pool = unsafe { device.raw().create_command_pool(&pool_info, None)? };
+
+        // Create a fence for waiting
+        let fence = Fence::new(device.clone(), false)?;
+
+        let new_setup = TransferSetup {
+            command_pool,
+            queue,
+            fence,
+        };
+
         Ok(Self {
             _instance: instance,
             device,
@@ -159,7 +184,7 @@ impl ResourceManager {
             buffers: Mutex::new(HashMap::new()),
             images: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
-            transfer_setup: Mutex::new(None),
+            transfer_setup: Arc::new(Mutex::new(new_setup)),
         })
     }
 
@@ -168,114 +193,59 @@ impl ResourceManager {
         self.allocator.clone()
     }
 
-    /// Gets or initializes the TransferSetup resources.
-    fn get_transfer_setup(&self) -> Result<TransferSetup> {
-        let mut setup_guard = self.transfer_setup.lock()?;
-
-        if let Some(setup) = setup_guard.as_ref() {
-            // Simple check: Reset fence before reusing
-            unsafe { self.device.raw().reset_fences(&[setup.fence])? };
-            return Ok(TransferSetup {
-                // Return a copy/clone
-                command_pool: setup.command_pool,
-                queue: setup.queue.clone(),
-                fence: setup.fence,
-            });
-        }
-
-        debug!("Initializing TransferSetup...");
-        // Find a queue that supports transfer (prefer dedicated, fallback to graphics)
-        let queue_family_index = self
-            .device
-            .transfer_queue_family_index()
-            .or(self.device.compute_queue_family_index()) // Try compute as fallback
-            .unwrap_or(self.device.graphics_queue_family_index()); // Graphics as last resort
-
-        let queue = self.device.get_queue(queue_family_index, 0)?;
-
-        // Create command pool for transfer commands
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT) // Hint that buffers are short-lived
-            .queue_family_index(queue_family_index);
-        let command_pool = unsafe { self.device.raw().create_command_pool(&pool_info, None)? };
-
-        // Create a fence for waiting
-        let fence_info = vk::FenceCreateInfo::default();
-        let fence = unsafe { self.device.raw().create_fence(&fence_info, None)? };
-
-        let new_setup = TransferSetup {
-            command_pool,
-            queue,
-            fence,
-        };
-        *setup_guard = Some(new_setup); // Store it
-        debug!("TransferSetup initialized.");
-
-        // Return a new copy for use
-        Ok(TransferSetup {
-            command_pool: setup_guard.as_ref().unwrap().command_pool,
-            queue: setup_guard.as_ref().unwrap().queue.clone(),
-            fence: setup_guard.as_ref().unwrap().fence,
-        })
-    }
-
-    /// Helper to allocate, begin, end, submit, and wait for a single command buffer.
+    /// Helper to allocate, begin, end, submit, and wait for a single command buffer
+    /// using the provided TransferSetup.
     unsafe fn submit_commands_and_wait<F>(
         &self,
-        transfer_setup: &TransferSetup,
+        transfer_setup: &TransferSetup, // Use the cloned setup
         record_fn: F,
     ) -> Result<()>
     where
-        F: FnOnce(vk::CommandBuffer) -> Result<()>,
+        F: FnOnce(vk::CommandBuffer) -> Result<()>, // Closure records commands
     {
-        let device = self.device.raw();
+        let device_raw = self.device.raw(); // Get raw ash::Device
 
         // Allocate command buffer
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(transfer_setup.command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let command_buffer = device.allocate_command_buffers(&alloc_info)?[0];
+        let command_buffer = device_raw.allocate_command_buffers(&alloc_info)?[0];
+        tracing::info!("Allocated command_buffer: {:?}", command_buffer);
+        trace!("Allocated temporary command buffer for transfer.");
 
         // Begin recording
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        device.begin_command_buffer(command_buffer, &begin_info)?;
+        device_raw.begin_command_buffer(command_buffer, &begin_info)?;
 
-        // Record user commands
+        // --- Record user commands ---
         let record_result = record_fn(command_buffer);
-
-        // End recording (even if user function failed, to allow cleanup)
-        device.end_command_buffer(command_buffer)?;
+        // --- End Recording ---
+        // Always end buffer, even if recording failed, to allow cleanup
+        device_raw.end_command_buffer(command_buffer)?;
 
         // Check user function result *after* ending buffer
         record_result?;
+        trace!("Transfer commands recorded.");
 
-        let binding = [command_buffer];
-        // Submit
-        let submits = [vk::SubmitInfo::default().command_buffers(&binding)];
-        // Use the transfer queue and fence
+        // Submit to the transfer queue
+        let submits =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer))];
+        // Use the queue from the TransferSetup. Assuming Queue::submit handles locking.
         transfer_setup
             .queue
-            .submit(self.device.raw(), &submits, None)?; // Submit without fence initially
+            .submit(device_raw, &submits, Some(&transfer_setup.fence))?; // Submit WITH fence
+        trace!("Transfer command buffer submitted.");
 
-        // Wait for completion using a separate wait call
-        // This avoids holding the queue's internal submit lock during the wait.
-        let fences = [transfer_setup.fence];
-        match device.wait_for_fences(&fences, true, u64::MAX) {
-            Ok(_) => {}
-            Err(vk::Result::TIMEOUT) => {
-                // Should not happen with u64::MAX
-                warn!("Transfer fence wait timed out unexpectedly.");
-                return Err(ResourceManagerError::TransferFailed(
-                    "Fence wait timeout".to_string(),
-                ));
-            }
-            Err(e) => return Err(e.into()),
-        }
+        // Wait for completion using the fence
+        transfer_setup.fence.wait(None)?;
 
-        // Free command buffer
-        device.free_command_buffers(transfer_setup.command_pool, &[command_buffer]);
+        // Free command buffer *after* successful wait
+        device_raw.free_command_buffers(transfer_setup.command_pool, &[command_buffer]);
+        trace!("Temporary command buffer freed.");
+
+        transfer_setup.fence.reset()?;
 
         Ok(())
     }
@@ -387,7 +357,7 @@ impl ResourceManager {
         let dest_handle = self.create_buffer(size, final_usage, location)?;
 
         // 4. Record and submit transfer command
-        let transfer_setup = self.get_transfer_setup()?;
+        let transfer_setup = self.transfer_setup.lock()?;
         let dest_info = self.get_buffer_info(dest_handle)?; // Get info for vk::Buffer handle
         let staging_info_for_copy = self.get_buffer_info(staging_handle)?; // Get info again
 
@@ -589,22 +559,18 @@ impl Drop for ResourceManager {
         debug!("Clearing {} image entries...", images_map.len());
         images_map.clear();
 
-        // Destroy transfer setup resources
-        let mut setup_guard = self
+        let setup = self
             .transfer_setup
             .lock()
             .expect("mutex to not be poisoned");
-        if let Some(setup) = setup_guard.take() {
-            // take() removes it from the Option
-            debug!("Destroying TransferSetup resources...");
-            unsafe {
-                self.device.raw().destroy_fence(setup.fence, None);
-                self.device
-                    .raw()
-                    .destroy_command_pool(setup.command_pool, None);
-            }
-            debug!("TransferSetup resources destroyed.");
+
+        debug!("Destroying TransferSetup resources...");
+        unsafe {
+            self.device
+                .raw()
+                .destroy_command_pool(setup.command_pool, None);
         }
+        debug!("TransferSetup resources destroyed.");
 
         // The Allocator is wrapped in an Arc<Mutex<>>, so its Drop will be handled
         // when the last Arc reference (including those held by Internal*Info) is dropped.

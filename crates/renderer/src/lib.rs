@@ -1,6 +1,8 @@
 use std::{
-    ffi::CStr,
+    ffi::{c_void, CStr},
+    mem,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use ash::vk;
@@ -10,14 +12,15 @@ use gfx_hal::{
     device::Device, error::GfxHalError, queue::Queue, surface::Surface, swapchain::Swapchain,
     swapchain::SwapchainConfig, sync::Fence, sync::Semaphore,
 };
-use gpu_allocator::{vulkan::Allocator, MemoryLocation};
-use resource_manager::{ImageHandle, ResourceManager, ResourceManagerError};
+use glam::{Mat4, Vec3};
+use gpu_allocator::{
+    vulkan::{Allocation, AllocationCreateDesc, Allocator},
+    MemoryLocation,
+};
+use resource_manager::{Geometry, ImageHandle, ResourceManager, ResourceManagerError};
+use shared::{CameraInfo, UniformBufferObject};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
-// Assuming winit is used by the app
-
-// Re-export ash for convenience if needed elsewhere
-pub use ash;
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
@@ -55,6 +58,14 @@ pub enum RendererError {
     ImageInfoUnavailable,
     #[error("Failed to get allocator from resource manager")]
     AllocatorUnavailable, // Added based on egui requirement
+    #[error("Allocator Error: {0}")]
+    AllocatorError(#[from] gpu_allocator::AllocationError),
+}
+
+impl<T> From<std::sync::PoisonError<T>> for RendererError {
+    fn from(_: std::sync::PoisonError<T>) -> Self {
+        Self::AllocatorUnavailable
+    }
 }
 
 struct FrameData {
@@ -64,6 +75,12 @@ struct FrameData {
     render_finished_semaphore: Semaphore,
     textures_to_free: Option<Vec<TextureId>>,
     in_flight_fence: Fence,
+
+    descriptor_set: vk::DescriptorSet,
+    uniform_buffer_object: UniformBufferObject,
+    uniform_buffer: vk::Buffer,
+    uniform_buffer_allocation: Allocation,
+    uniform_buffer_mapped_ptr: *mut c_void,
 }
 
 struct SwapchainSupportDetails {
@@ -84,14 +101,19 @@ pub struct Renderer {
     swapchain_format: vk::SurfaceFormatKHR,
     swapchain_extent: vk::Extent2D,
 
+    scene: Vec<Geometry>,
+
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+
     egui_renderer: EguiRenderer,
 
     depth_image_handle: ImageHandle,
     depth_image_view: vk::ImageView, // Store the view directly
     depth_format: vk::Format,
 
-    triangle_pipeline_layout: vk::PipelineLayout,
-    triangle_pipeline: vk::Pipeline,
+    model_pipeline_layout: vk::PipelineLayout,
+    model_pipeline: vk::Pipeline,
 
     frames_data: Vec<FrameData>,
     current_frame: usize,
@@ -100,6 +122,8 @@ pub struct Renderer {
     window_resized: bool,
     current_width: u32,
     current_height: u32,
+
+    start_time: Instant,
 }
 
 impl Renderer {
@@ -109,6 +133,7 @@ impl Renderer {
         graphics_queue: Arc<Queue>,
         surface: Arc<Surface>,
         resource_manager: Arc<ResourceManager>,
+        scene: Vec<Geometry>,
         initial_width: u32,
         initial_height: u32,
     ) -> Result<Self, RendererError> {
@@ -128,10 +153,26 @@ impl Renderer {
         let (depth_image_handle, depth_image_view) =
             Self::create_depth_resources(&device, &resource_manager, extent, depth_format)?;
 
-        let (triangle_pipeline_layout, triangle_pipeline) =
-            Self::create_triangle_pipeline(&device, format.format, depth_format)?;
+        let (descriptor_set_layout, descriptor_pool) =
+            Self::create_descriptor_sets_resources(&device)?;
 
-        let frames_data = Self::create_frame_data(&device)?;
+        let (model_pipeline_layout, model_pipeline) = Self::create_model_pipeline(
+            &device,
+            format.format,
+            depth_format,
+            descriptor_set_layout,
+        )?;
+
+        let start_time = Instant::now();
+
+        let frames_data = Self::create_frame_data(
+            &device,
+            &resource_manager,
+            descriptor_pool,
+            descriptor_set_layout,
+            swapchain.extent(),
+            start_time,
+        )?;
 
         info!("Renderer initialized successfully.");
 
@@ -144,6 +185,7 @@ impl Renderer {
             },
             Options {
                 srgb_framebuffer: true,
+                in_flight_frames: MAX_FRAMES_IN_FLIGHT,
                 ..Default::default()
             },
         )?;
@@ -159,16 +201,21 @@ impl Renderer {
             swapchain_image_views: image_views,
             swapchain_format: format,
             swapchain_extent: extent,
+            descriptor_set_layout,
+            descriptor_pool,
             depth_image_handle,
             depth_image_view,
             depth_format,
-            triangle_pipeline_layout,
-            triangle_pipeline,
+            model_pipeline_layout,
+            model_pipeline,
             frames_data,
+            scene,
             current_frame: 0,
             window_resized: false,
             current_width: initial_width,
             current_height: initial_height,
+
+            start_time,
         })
     }
 
@@ -208,6 +255,7 @@ impl Renderer {
         &mut self,
         pixels_per_point: f32,
         clipped_primitives: &[ClippedPrimitive],
+        camera_info: CameraInfo,
     ) -> Result<(), RendererError> {
         // --- Handle Resize ---
         if self.window_resized {
@@ -229,6 +277,7 @@ impl Renderer {
             .swapchain
             .as_ref()
             .ok_or(RendererError::SwapchainAcquisitionFailed)?;
+
         let (image_index, suboptimal) = unsafe {
             // Need unsafe block for acquire_next_image
             swapchain_ref.acquire_next_image(
@@ -250,7 +299,6 @@ impl Renderer {
         frame_data.in_flight_fence.reset()?;
 
         if let Some(textures) = frame_data.textures_to_free.take() {
-            tracing::debug!("Freeing EGUI Textures");
             self.egui_renderer.free_textures(&textures)?;
         }
 
@@ -265,6 +313,15 @@ impl Renderer {
         let command_buffer = frame_data.command_buffer;
         let cmd_begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        // -- Update uniform buffer --
+        self.update_uniform_buffer(camera_info)?;
+
+        let frame_data = &mut self.frames_data[self.current_frame];
+        let swapchain_ref = self
+            .swapchain
+            .as_ref()
+            .ok_or(RendererError::SwapchainAcquisitionFailed)?;
 
         unsafe {
             // Need unsafe for Vulkan commands
@@ -373,10 +430,21 @@ impl Renderer {
             self.device.raw().cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.triangle_pipeline,
+                self.model_pipeline,
             );
-            // Draw 3 vertices, 1 instance, 0 first vertex, 0 first instance
-            self.device.raw().cmd_draw(command_buffer, 3, 1, 0, 0);
+
+            self.device.raw().cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.model_pipeline_layout,
+                0,
+                &[frame_data.descriptor_set],
+                &[],
+            );
+        }
+
+        for g in &self.scene {
+            g.draw(self.device.raw(), command_buffer)?;
         }
 
         tracing::trace!("Rendering EGUI");
@@ -682,33 +750,12 @@ impl Renderer {
     }
 
     // --- Helper: Create Triangle Pipeline ---
-    fn create_triangle_pipeline(
+    fn create_model_pipeline(
         device: &Arc<Device>,
         color_format: vk::Format,
         depth_format: vk::Format,
+        descriptor_set_layout: vk::DescriptorSetLayout,
     ) -> Result<(vk::PipelineLayout, vk::Pipeline), RendererError> {
-        // --- Shaders (Hardcoded example) ---
-        // Vertex Shader (GLSL) - outputs clip space position based on vertex index
-        /*
-        #version 450
-        vec2 positions[3] = vec2[](
-            vec2(0.0, -0.5),
-            vec2(0.5, 0.5),
-            vec2(-0.5, 0.5)
-        );
-        void main() {
-            gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
-        }
-        */
-        // Fragment Shader (GLSL) - outputs solid orange
-        /*
-        #version 450
-        layout(location = 0) out vec4 outColor;
-        void main() {
-            outColor = vec4(1.0, 0.5, 0.0, 1.0); // Orange
-        }
-        */
-
         // Load compiled SPIR-V (replace with actual loading)
         let vert_shader_code = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/vert.glsl.spv")); // Placeholder path
         let frag_shader_code = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/frag.glsl.spv")); // Placeholder path
@@ -730,8 +777,13 @@ impl Renderer {
 
         let shader_stages = [vert_stage_info, frag_stage_info];
 
+        let binding_description = shared::Vertex::get_binding_decription();
+        let attribute_descriptions = shared::Vertex::get_attribute_descriptions();
+
         // --- Fixed Function State ---
-        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default(); // No vertex buffers/attributes
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&binding_description))
+            .vertex_attribute_descriptions(&attribute_descriptions);
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
@@ -774,7 +826,8 @@ impl Renderer {
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
         // --- Pipeline Layout ---
-        let layout_info = vk::PipelineLayoutCreateInfo::default(); // No descriptors/push constants
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout)); // No descriptors/push constants
         let pipeline_layout = unsafe {
             device
                 .raw()
@@ -872,7 +925,14 @@ impl Renderer {
     }
 
     // --- Helper: Create Frame Sync Objects & Command Resources ---
-    fn create_frame_data(device: &Arc<Device>) -> Result<Vec<FrameData>, RendererError> {
+    fn create_frame_data(
+        device: &Arc<Device>,
+        resource_manager: &Arc<ResourceManager>,
+        descriptor_pool: vk::DescriptorPool,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        swapchain_extent: vk::Extent2D,
+        instant: Instant,
+    ) -> Result<Vec<FrameData>, RendererError> {
         let mut frames_data = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             let image_available_semaphore = Semaphore::new(device.clone())?;
@@ -905,6 +965,19 @@ impl Renderer {
                     .map_err(RendererError::CommandBufferAllocation)?[0]
             };
 
+            tracing::info!("Allocated frame_data command_buffer: {:?}", command_buffer);
+
+            let descriptor_set =
+                Self::create_descriptor_set(device, descriptor_set_layout, descriptor_pool)?;
+
+            let (uniform_buffer, uniform_buffer_allocation, uniform_buffer_mapped_ptr) =
+                Self::create_uniform_buffer(device, resource_manager)?;
+
+            Self::update_descriptor_set(device.clone(), descriptor_set, uniform_buffer);
+
+            let uniform_buffer_object =
+                calculate_ubo(CameraInfo::default(), swapchain_extent, instant);
+
             frames_data.push(FrameData {
                 textures_to_free: None,
                 command_pool,
@@ -912,6 +985,11 @@ impl Renderer {
                 image_available_semaphore,
                 render_finished_semaphore,
                 in_flight_fence,
+                descriptor_set,
+                uniform_buffer,
+                uniform_buffer_allocation,
+                uniform_buffer_mapped_ptr,
+                uniform_buffer_object,
             });
         }
         Ok(frames_data)
@@ -936,22 +1014,20 @@ impl Renderer {
     }
 
     fn choose_swapchain_format(available_formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
-        available_formats
+        *available_formats
             .iter()
             .find(|format| {
                 format.format == vk::Format::B8G8R8A8_SRGB // Prefer SRGB
                     && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
             })
-            .unwrap_or(&available_formats[0]) // Fallback to first available
-            .clone()
+            .unwrap_or(&available_formats[0])
     }
 
     fn choose_swapchain_present_mode(available_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
-        available_modes
+        *available_modes
             .iter()
             .find(|&&mode| mode == vk::PresentModeKHR::MAILBOX) // Prefer Mailbox (low latency)
-            .unwrap_or(&vk::PresentModeKHR::FIFO) // Guaranteed fallback
-            .clone()
+            .unwrap_or(&vk::PresentModeKHR::FIFO)
     }
 
     fn choose_swapchain_extent(
@@ -1004,6 +1080,166 @@ impl Renderer {
             vk::Result::ERROR_FORMAT_NOT_SUPPORTED,
         )) // Or custom error
     }
+
+    fn create_descriptor_sets_resources(
+        device: &Arc<Device>,
+    ) -> Result<(vk::DescriptorSetLayout, vk::DescriptorPool), RendererError> {
+        let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX);
+
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(std::slice::from_ref(&ubo_layout_binding));
+
+        let descriptor_set_layout = unsafe {
+            device
+                .raw()
+                .create_descriptor_set_layout(&layout_info, None)?
+        };
+
+        let pool_size = vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+        };
+
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(std::slice::from_ref(&pool_size))
+            .max_sets(MAX_FRAMES_IN_FLIGHT as u32);
+
+        let descriptor_pool = unsafe { device.raw().create_descriptor_pool(&pool_info, None)? };
+
+        Ok((descriptor_set_layout, descriptor_pool))
+    }
+
+    fn create_descriptor_set(
+        device: &Arc<Device>,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+        descriptor_pool: vk::DescriptorPool,
+    ) -> Result<vk::DescriptorSet, RendererError> {
+        let layouts = vec![descriptor_set_layout; 1];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&layouts);
+
+        let descriptor_set = unsafe { device.raw().allocate_descriptor_sets(&alloc_info)? }[0];
+
+        Ok(descriptor_set)
+    }
+
+    fn create_uniform_buffer(
+        device: &Arc<Device>,
+        resource_manager: &Arc<ResourceManager>,
+    ) -> Result<(vk::Buffer, Allocation, *mut std::ffi::c_void), RendererError> {
+        let buffer_size = mem::size_of::<UniformBufferObject>() as vk::DeviceSize;
+
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(buffer_size)
+            .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let allocation = resource_manager
+            .allocator()
+            .lock()?
+            .allocate(&AllocationCreateDesc {
+                name: "Uniform Buffer",
+                requirements: unsafe {
+                    {
+                        let temp_buffer = device.raw().create_buffer(&buffer_info, None)?;
+                        let req = device.raw().get_buffer_memory_requirements(temp_buffer);
+
+                        device.raw().destroy_buffer(temp_buffer, None);
+                        req
+                    }
+                },
+                location: MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            })?;
+
+        let buffer = unsafe { device.raw().create_buffer(&buffer_info, None)? };
+        tracing::info!("Created uniform buffer {:?}", buffer);
+
+        unsafe {
+            device
+                .raw()
+                .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())?;
+        }
+
+        let mapped_ptr = allocation
+            .mapped_ptr()
+            .ok_or_else(|| {
+                error!("Failed to get mapped pointer for CPU->GPU uniform buffer");
+                ResourceManagerError::Other("Failed to map uniform buffer".to_string())
+            })?
+            .as_ptr();
+
+        Ok((buffer, allocation, mapped_ptr))
+    }
+
+    fn update_descriptor_set(
+        device: Arc<Device>,
+        descriptor_set: vk::DescriptorSet,
+        buffer: vk::Buffer,
+    ) {
+        let buffer_info = vk::DescriptorBufferInfo::default()
+            .buffer(buffer)
+            .offset(0)
+            .range(mem::size_of::<UniformBufferObject>() as vk::DeviceSize);
+
+        let descriptor_write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(std::slice::from_ref(&buffer_info));
+
+        unsafe {
+            device
+                .raw()
+                .update_descriptor_sets(std::slice::from_ref(&descriptor_write), &[]);
+        }
+    }
+
+    fn update_uniform_buffer(&mut self, camera_info: CameraInfo) -> Result<(), RendererError> {
+        let frame_data = &mut self.frames_data[self.current_frame];
+
+        let ubo = calculate_ubo(camera_info, self.swapchain_extent, self.start_time);
+
+        if frame_data.uniform_buffer_object != ubo {
+            let ptr = frame_data.uniform_buffer_mapped_ptr;
+            unsafe {
+                let aligned_ptr = ptr as *mut UniformBufferObject;
+                aligned_ptr.write(ubo);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn calculate_ubo(
+    camera_info: CameraInfo,
+    swapchain_extent: vk::Extent2D,
+    start: Instant,
+) -> UniformBufferObject {
+    let time = start.elapsed();
+
+    let model = Mat4::from_rotation_y(time.as_secs_f32());
+
+    let view = Mat4::look_at_rh(camera_info.camera_pos, camera_info.camera_target, Vec3::Y);
+
+    let mut proj = Mat4::perspective_rh(
+        camera_info.camera_fov.to_radians(),
+        swapchain_extent.width as f32 / swapchain_extent.height as f32,
+        0.1,
+        1000.0,
+    );
+
+    proj.y_axis.y *= -1.0;
+
+    UniformBufferObject { model, view, proj }
 }
 
 // --- Drop Implementation ---
@@ -1027,16 +1263,39 @@ impl Drop for Renderer {
         unsafe {
             self.device
                 .raw()
-                .destroy_pipeline(self.triangle_pipeline, None);
+                .destroy_pipeline(self.model_pipeline, None);
             self.device
                 .raw()
-                .destroy_pipeline_layout(self.triangle_pipeline_layout, None);
+                .destroy_pipeline_layout(self.model_pipeline_layout, None);
+        }
+
+        unsafe {
+            self.device
+                .raw()
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .raw()
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
         }
 
         // Destroy frame data (fences, semaphores, command pools)
         // Fences/Semaphores are handled by gfx_hal::Drop
         // Command buffers are freed with the pool
         for frame_data in self.frames_data.drain(..) {
+            unsafe {
+                self.device
+                    .raw()
+                    .destroy_buffer(frame_data.uniform_buffer, None);
+
+                let mut allocator = self
+                    .allocator
+                    .lock()
+                    .expect("Allocator Mutex to not be poisoned.");
+                allocator
+                    .free(frame_data.uniform_buffer_allocation)
+                    .expect("Allocator to be able to free an allocation");
+            }
+
             unsafe {
                 self.device
                     .raw()

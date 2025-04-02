@@ -65,18 +65,6 @@ impl Queue {
         submits: &[vk::SubmitInfo],
         signal_fence: Option<&Fence>,
     ) -> Result<()> {
-        debug_assert!(
-            self.device.raw().handle() == submit_device_raw.handle(),
-            "Queue::submit called with an ash::Device from a different logical VkDevice than the queue belongs to!"
-        );
-        // Optional: Check fence device consistency
-        if let Some(fence) = signal_fence {
-            debug_assert!(
-                 fence.device().raw().handle() == submit_device_raw.handle(),
-                 "Fence passed to Queue::submit belongs to a different logical device than submit_device_raw!"
-             );
-        }
-
         let fence_handle = signal_fence.map_or(vk::Fence::null(), |f| f.handle());
 
         // Keep the lock for thread-safety on the VkQueue object itself

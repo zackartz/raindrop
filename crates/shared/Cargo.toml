@@ -1,0 +1,11 @@
+[package]
+name = "shared"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam.workspace = true
+ash.workspace = true
+bytemuck.workspace = true
+memoffset = "0.9.1"
+derive_builder = "0.20.2"

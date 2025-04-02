@@ -10,6 +10,7 @@ use crate::{
 /// Wraps a `vk::Fence`, used for CPU-GPU synchronization.
 ///
 /// Owns the `vk::Fence` handle.
+#[derive(Clone)]
 pub struct Fence {
     device: Arc<Device>,
     fence: vk::Fence,

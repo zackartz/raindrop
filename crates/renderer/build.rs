@@ -16,6 +16,8 @@ fn main() -> Result<()> {
     let out_dir = PathBuf::from(env::var("OUT_DIR")?).join("shaders"); // Put shaders in a subdirectory for clarity
     fs::create_dir_all(&out_dir).context("Failed to create shader output directory")?;
 
+    println!("cargo:rerun-if-changed=build.rs");
+
     let compiler = Compiler::new().context("Failed to create shader compiler")?;
     let mut options = CompileOptions::new().context("Failed to create compile options")?;
 
@@ -49,6 +51,7 @@ fn main() -> Result<()> {
         .filter(|e| e.file_type().is_file())
     // Only process files
     {
+        println!("cargo:rerun-if-changed={:?}", entry.path());
         let in_path = entry.path();
 
         // Determine shader kind from extension

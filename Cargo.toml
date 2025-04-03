@@ -5,7 +5,7 @@ members = [
   "crates/engine",
   "crates/gfx_hal",
   "crates/renderer",
-  "crates/resource_manager",
+  "crates/resource_manager", "crates/shared",
 ]
 
 [workspace.dependencies]

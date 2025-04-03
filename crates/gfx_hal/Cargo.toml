@@ -9,3 +9,4 @@ ash-window.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 winit.workspace = true
+gpu-allocator.workspace = true

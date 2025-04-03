@@ -63,6 +63,10 @@ pub enum GfxHalError {
     /// Placeholder for other specific errors.
     #[error("An unexpected error occurred: {0}")]
     Other(String),
+
+    /// Size for Buffer is invalid.
+    #[error("Buffer size is invalid.")]
+    BufferSizeInvalid,
 }
 
 pub type Result<T, E = GfxHalError> = std::result::Result<T, E>;

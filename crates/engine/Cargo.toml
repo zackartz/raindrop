@@ -13,9 +13,12 @@ tracing-subscriber.workspace = true
 winit.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
+glam.workspace = true
 
 gfx_hal = { path = "../gfx_hal" }
 renderer = { path = "../renderer" }
 resource_manager = { path = "../resource_manager" }
+shared = { path = "../shared" }
+
 clap = { version = "4.5.34", features = ["derive"] }
 egui-winit = "0.31.1"

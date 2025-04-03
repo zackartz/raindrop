@@ -8,15 +8,17 @@ use std::{
 
 use ash::vk;
 use clap::Parser;
-use egui::{Context, ViewportId};
+use egui::{Context, Slider, ViewportId};
 use egui_winit::State;
 use gfx_hal::{
     device::Device, error::GfxHalError, instance::Instance, instance::InstanceConfig,
     physical_device::PhysicalDevice, queue::Queue, surface::Surface,
 };
+use glam::Vec3;
 use raw_window_handle::HasDisplayHandle;
 use renderer::{Renderer, RendererError};
-use resource_manager::{ResourceManager, ResourceManagerError};
+use resource_manager::{Geometry, ResourceManager, ResourceManagerError};
+use shared::{CameraInfo, Vertex};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use winit::{
@@ -25,6 +27,7 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
     window::Window,
 };
+
 // --- Configuration ---
 const APP_NAME: &str = "BeginDisregard";
 const ENGINE_NAME: &str = "Engine";
@@ -69,18 +72,33 @@ struct Application {
     frame_count: u32,
     last_fps_update_time: Instant,
     last_frame_time: Instant,
+    current_fps: f64,
 }
 
 #[derive(Default)]
-struct EditorUI {}
+struct EditorUI {
+    camera_info: CameraInfo,
+}
 
 impl EditorUI {
     fn title() -> String {
         "engine".to_string()
     }
 
-    fn build_ui(&mut self, ctx: &egui::Context) {
-        egui::Window::new(Self::title()).show(ctx, |ui| ui.label(Self::title()));
+    fn build_ui(&mut self, ctx: &egui::Context, current_fps: f64) {
+        egui::Window::new(Self::title()).show(ctx, |ui| {
+            ui.label(format!("FPS - {:.2}", current_fps));
+
+            ui.separator();
+
+            egui::Grid::new("main_grid")
+                .spacing([40.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("FOV");
+                    ui.add(Slider::new(&mut self.camera_info.camera_fov, 10.0..=120.0));
+                });
+        });
     }
 }
 
@@ -241,14 +259,61 @@ impl Application {
 
         // Get specific queues (assuming graphics and present are the same for simplicity)
         let graphics_queue = device.get_graphics_queue();
-        let queue_associated_device_handle = graphics_queue.device().raw().handle();
 
         // --- 4. Resource Manager ---
         let resource_manager = Arc::new(ResourceManager::new(instance.clone(), device.clone())?);
         info!("Resource Manager initialized.");
 
-        let renderer_device_handle_to_pass = device.raw().handle();
-        let renderer_queue_device_handle_to_pass = graphics_queue.device().raw().handle();
+        let vertices = vec![
+            // Define 8 vertices for a cube with positions and colors
+            // Make sure winding order is correct (e.g., counter-clockwise for front faces)
+            Vertex {
+                pos: Vec3::new(-0.5, -0.5, 0.5).into(),
+                color: Vec3::new(1.0, 0.0, 0.0).into(),
+            }, // Front bottom left 0
+            Vertex {
+                pos: Vec3::new(0.5, -0.5, 0.5).into(),
+                color: Vec3::new(0.0, 1.0, 0.0).into(),
+            }, // Front bottom right 1
+            Vertex {
+                pos: Vec3::new(0.5, 0.5, 0.5).into(),
+                color: Vec3::new(0.0, 0.0, 1.0).into(),
+            }, // Front top right 2
+            Vertex {
+                pos: Vec3::new(-0.5, 0.5, 0.5).into(),
+                color: Vec3::new(1.0, 1.0, 0.0).into(),
+            }, // Front top left 3
+            // ... add back face vertices (4-7) ...
+            Vertex {
+                pos: Vec3::new(-0.5, -0.5, -0.5).into(),
+                color: Vec3::new(1.0, 0.0, 1.0).into(),
+            }, // Back bottom left 4
+            Vertex {
+                pos: Vec3::new(0.5, -0.5, -0.5).into(),
+                color: Vec3::new(0.0, 1.0, 1.0).into(),
+            }, // Back bottom right 5
+            Vertex {
+                pos: Vec3::new(0.5, 0.5, -0.5).into(),
+                color: Vec3::new(0.5, 0.5, 0.5).into(),
+            }, // Back top right 6
+            Vertex {
+                pos: Vec3::new(-0.5, 0.5, -0.5).into(),
+                color: Vec3::new(1.0, 1.0, 1.0).into(),
+            }, // Back top left 7
+        ];
+
+        let indices = vec![
+            // Define 12 triangles (36 indices) for the cube faces
+            // Front face
+            0, 1, 2, 2, 3, 0, // Right face
+            1, 5, 6, 6, 2, 1, // Back face
+            5, 4, 7, 7, 6, 5, // Left face
+            4, 0, 3, 3, 7, 4, // Top face
+            3, 2, 6, 6, 7, 3, // Bottom face
+            4, 5, 1, 1, 0, 4,
+        ];
+
+        let cube_geometry = Geometry::new(resource_manager.clone(), &vertices, &indices)?;
 
         // --- 5. Renderer ---
         let initial_size = window.inner_size();
@@ -258,6 +323,7 @@ impl Application {
             graphics_queue.clone(),
             surface.clone(),
             resource_manager.clone(),
+            vec![cube_geometry],
             initial_size.width,
             initial_size.height,
         )?;
@@ -288,6 +354,7 @@ impl Application {
             egui_ctx,
             egui_app,
             frame_count: 0,
+            current_fps: 0.,
             last_fps_update_time: Instant::now(),
             last_frame_time: Instant::now(),
         })
@@ -332,6 +399,7 @@ impl Application {
 
                 if elapsed_sice_last_update >= Duration::from_secs(1) {
                     let fps = self.frame_count as f64 / elapsed_sice_last_update.as_secs_f64();
+                    self.current_fps = fps;
 
                     let new_title = format!("{} - {} - {:.0} FPS", ENGINE_NAME, APP_NAME, fps);
                     self.window.set_title(&new_title);
@@ -349,7 +417,7 @@ impl Application {
                     pixels_per_point,
                     ..
                 } = self.egui_ctx.run(raw_input, |ctx| {
-                    self.egui_app.build_ui(ctx);
+                    self.egui_app.build_ui(ctx, self.current_fps);
                 });
 
                 self.renderer.update_textures(textures_delta).unwrap();
@@ -360,10 +428,11 @@ impl Application {
                 let clipped_primitives = self.egui_ctx.tessellate(shapes, pixels_per_point);
 
                 // --- Render Frame ---
-                match self
-                    .renderer
-                    .render_frame(pixels_per_point, &clipped_primitives)
-                {
+                match self.renderer.render_frame(
+                    pixels_per_point,
+                    &clipped_primitives,
+                    self.egui_app.camera_info,
+                ) {
                     Ok(_) => {
                         self.window.request_redraw();
                     }
@@ -499,7 +568,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_ansi(true)
         .with_file(false)
         .with_line_number(false)
-        .with_filter(filter::LevelFilter::DEBUG);
+        .with_filter(filter::LevelFilter::INFO);
 
     let registry = tracing_subscriber::registry().with(fmt_layer);
 

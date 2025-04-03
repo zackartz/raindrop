@@ -57,7 +57,6 @@ struct InternalBufferInfo {
     allocation: Option<Allocation>, // Option because it's taken in Drop
     size: vk::DeviceSize,
     usage: vk::BufferUsageFlags,
-    mapped_ptr: Option<*mut u8>,
     handle: BufferHandle,
 }
 
@@ -135,8 +134,8 @@ pub struct ResourceManager {
     _instance: Arc<Instance>,
     device: Arc<Device>,
     allocator: Arc<Mutex<Allocator>>,
-    buffers: Mutex<HashMap<u64, InternalBufferInfo>>,
-    images: Mutex<HashMap<u64, InternalImageInfo>>,
+    buffers: Arc<Mutex<HashMap<u64, InternalBufferInfo>>>,
+    images: Arc<Mutex<HashMap<u64, InternalImageInfo>>>,
     next_id: AtomicU64,
     transfer_setup: Arc<Mutex<TransferSetup>>,
 }
@@ -181,8 +180,8 @@ impl ResourceManager {
             _instance: instance,
             device,
             allocator: Arc::new(Mutex::new(allocator)),
-            buffers: Mutex::new(HashMap::new()),
-            images: Mutex::new(HashMap::new()),
+            buffers: Arc::new(Mutex::new(HashMap::new())),
+            images: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             transfer_setup: Arc::new(Mutex::new(new_setup)),
         })
@@ -289,11 +288,6 @@ impl ResourceManager {
         }
         trace!("Buffer memory bound.");
 
-        let mapped_ptr = allocation.mapped_ptr().map(|p| p.as_ptr() as *mut u8);
-        if mapped_ptr.is_some() {
-            trace!("Buffer memory is mapped.");
-        }
-
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let handle = BufferHandle(id);
 
@@ -304,7 +298,6 @@ impl ResourceManager {
             allocation: Some(allocation),
             size,
             usage,
-            mapped_ptr,
             handle,
         };
 
@@ -503,12 +496,19 @@ impl ResourceManager {
         let buffers_map = self.buffers.lock()?;
         buffers_map
             .get(&handle.0)
-            .map(|internal| BufferInfo {
-                handle: internal.handle,
-                buffer: internal.buffer,
-                size: internal.size,
-                usage: internal.usage,
-                mapped_ptr: internal.mapped_ptr,
+            .map(|internal| {
+                let mapped_ptr = internal
+                    .allocation
+                    .as_ref()
+                    .and_then(|a| a.mapped_ptr().map(|p| p.as_ptr() as *mut u8));
+
+                BufferInfo {
+                    handle: internal.handle,
+                    buffer: internal.buffer,
+                    size: internal.size,
+                    usage: internal.usage,
+                    mapped_ptr,
+                }
             })
             .ok_or(ResourceManagerError::HandleNotFound(handle.0))
     }

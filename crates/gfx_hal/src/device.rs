@@ -15,7 +15,7 @@ use crate::queue::Queue;
 ///
 /// Owns the `ash::Device` and provides access to device functions and queues.
 pub struct Device {
-    instance: Arc<Instance>,
+    _instance: Arc<Instance>,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
     queues: Mutex<HashMap<(u32, u32), Arc<Queue>>>,
@@ -33,6 +33,7 @@ impl Device {
     /// - `queue_family_indicies` must be valid indicies obtained from the `physical_device_handle`.
     /// - `required_extensions` must be supported by the `physical_device_handle`.
     /// - All feature structs passed must be supported by the `physical_device_handle`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn new(
         instance: Arc<Instance>,
         physical_device_handle: vk::PhysicalDevice,
@@ -113,7 +114,7 @@ impl Device {
         // --- 4. Create the Device struct in an Arc (Stage 1) ---
         // Initialize the queues map as empty for now.
         let device_arc = Arc::new(Device {
-            instance: instance.clone(),
+            _instance: instance.clone(),
             physical_device: physical_device_handle,
             device: ash_device, // Move the created ash::Device here
             queues: Mutex::new(HashMap::new()), // Start with empty map

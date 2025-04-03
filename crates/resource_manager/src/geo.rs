@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ash::vk::{self, IndexType};
+use ash::vk;
 use gpu_allocator::MemoryLocation;
 use tracing::{debug, trace};
 

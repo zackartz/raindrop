@@ -1,5 +1,5 @@
 use std::{
-    ffi::{c_void, CStr},
+    ffi::c_void,
     mem,
     sync::{Arc, Mutex},
     time::Instant,
@@ -127,6 +127,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instance: Arc<gfx_hal::instance::Instance>, // Needed for allocator
         device: Arc<Device>,
@@ -510,12 +511,6 @@ impl Renderer {
             .command_buffers(&command_buffers)
             .signal_semaphores(&signal_semaphores);
 
-        // assert_eq!(
-        //     self.graphics_queue.device().raw().handle(), // Device from Queue
-        //     self.device.raw().handle(),                  // Device stored in Renderer
-        //     "Device handle mismatch between Renderer and Graphics Queue!"
-        // );
-
         unsafe {
             // Need unsafe for queue submit
             self.graphics_queue.submit(
@@ -593,10 +588,6 @@ impl Renderer {
         self.depth_image_handle = new_depth_handle;
         self.depth_image_view = new_depth_view;
 
-        // 4. Update Egui Renderer (if necessary, depends on its implementation)
-        // It might need the new extent or recreate internal resources.
-        // Assuming it handles extent changes via update_screen_descriptor called earlier.
-
         info!(
             "Swapchain recreated successfully ({}x{}).",
             new_extent.width, new_extent.height
@@ -607,7 +598,7 @@ impl Renderer {
     // --- Helper: Cleanup Swapchain Dependent Resources ---
     fn cleanup_swapchain_resources(&mut self) {
         debug!("Cleaning up swapchain resources...");
-        // Destroy depth buffer view
+
         unsafe {
             self.device
                 .raw()
@@ -616,9 +607,8 @@ impl Renderer {
         // Destroy depth buffer image via resource manager
         if let Err(e) = self.resource_manager.destroy_image(self.depth_image_handle) {
             error!("Failed to destroy depth image: {}", e);
-            // Continue cleanup even if this fails
         }
-        // Drop the old swapchain object (RAII in gfx_hal::Swapchain handles vkDestroySwapchainKHR)
+
         self.swapchain = None;
         debug!("Swapchain resources cleaned up.");
     }
@@ -665,37 +655,9 @@ impl Renderer {
         let swapchain =
             unsafe { Swapchain::new(device.clone(), surface.clone(), config, old_swapchain)? };
 
-        // Create Image Views
         let image_views = swapchain
             .image_views() // Assuming Swapchain::new creates and stores these
             .to_vec(); // Clone the slice into a Vec
-
-        // If Swapchain::new doesn't create views, we need to do it here:
-        /*
-        let images = swapchain.images()?; // Assuming this method exists
-        let mut image_views = Vec::with_capacity(images.len());
-        for &image in images.iter() {
-            let create_info = vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(surface_format.format)
-                .components(vk::ComponentMapping {
-                    r: vk::ComponentSwizzle::IDENTITY,
-                    g: vk::ComponentSwizzle::IDENTITY,
-                    b: vk::ComponentSwizzle::IDENTITY,
-                    a: vk::ComponentSwizzle::IDENTITY,
-                })
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            let view = unsafe { device.raw().create_image_view(&create_info, None)? };
-            image_views.push(view);
-        }
-        */
 
         Ok((swapchain, surface_format, extent, image_views))
     }
@@ -763,7 +725,7 @@ impl Renderer {
         let vert_module = Self::create_shader_module(device, vert_shader_code)?;
         let frag_module = Self::create_shader_module(device, frag_shader_code)?;
 
-        let main_function_name = CStr::from_bytes_with_nul(b"main\0").unwrap();
+        let main_function_name = c"main";
 
         let vert_stage_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
@@ -911,7 +873,7 @@ impl Renderer {
                                         // --------------------------------------------------------------------
 
         // 3. Create the shader module
-        let create_info = vk::ShaderModuleCreateInfo::default().code(&code_slice_ref); // Pass the &[u32] slice
+        let create_info = vk::ShaderModuleCreateInfo::default().code(code_slice_ref); // Pass the &[u32] slice
 
         unsafe {
             device
@@ -1026,7 +988,7 @@ impl Renderer {
     fn choose_swapchain_present_mode(available_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
         *available_modes
             .iter()
-            .find(|&&mode| mode == vk::PresentModeKHR::MAILBOX) // Prefer Mailbox (low latency)
+            .find(|&&mode| mode == vk::PresentModeKHR::FIFO) // Prefer Mailbox (low latency)
             .unwrap_or(&vk::PresentModeKHR::FIFO)
     }
 
@@ -1078,7 +1040,7 @@ impl Renderer {
         }
         Err(RendererError::Vulkan(
             vk::Result::ERROR_FORMAT_NOT_SUPPORTED,
-        )) // Or custom error
+        ))
     }
 
     fn create_descriptor_sets_resources(

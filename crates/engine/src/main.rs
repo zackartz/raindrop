@@ -568,7 +568,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_ansi(true)
         .with_file(false)
         .with_line_number(false)
-        .with_filter(filter::LevelFilter::INFO);
+        .with_filter(filter::LevelFilter::DEBUG);
 
     let registry = tracing_subscriber::registry().with(fmt_layer);
 

@@ -17,14 +17,16 @@ use gfx_hal::{
 use glam::Vec3;
 use raw_window_handle::HasDisplayHandle;
 use renderer::{Renderer, RendererError};
-use resource_manager::{Geometry, ResourceManager, ResourceManagerError};
-use shared::{CameraInfo, Vertex};
+use resource_manager::{ResourceManager, ResourceManagerError};
+use scene::Scene;
+use shared::CameraInfo;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt, Layer};
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, KeyEvent, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     window::Window,
 };
 
@@ -47,6 +49,8 @@ enum AppError {
     NoSuitableDevice,
     #[error("Failed to create CString: {0}")]
     NulError(#[from] std::ffi::NulError),
+    #[error("Scene Error: {0}")]
+    SceneError(#[from] scene::SceneError),
 }
 
 struct Application {
@@ -66,6 +70,23 @@ struct Application {
     egui_winit: State,
     egui_app: EditorUI,
 
+    // --- Camera State ---
+    camera_info: CameraInfo,
+    camera_speed: f32,
+    camera_sensitivity: f32,
+
+    // --- Input State ---
+    is_forward_pressed: bool,
+    is_backward_pressed: bool,
+    is_left_pressed: bool,
+    is_right_pressed: bool,
+    is_up_pressed: bool,   // Optional: For flying up
+    is_down_pressed: bool, // Optional: For flying down
+    is_rmb_pressed: bool,  // Right mouse button
+    last_mouse_pos: Option<(f64, f64)>,
+    mouse_delta: (f64, f64),
+    capture_mouse: bool, // Flag to indicate if mouse should control camera
+
     // Windowing
     window: Arc<Window>, // Use Arc for potential multi-threading later
 
@@ -76,17 +97,15 @@ struct Application {
 }
 
 #[derive(Default)]
-struct EditorUI {
-    camera_info: CameraInfo,
-}
+struct EditorUI {}
 
 impl EditorUI {
     fn title() -> String {
         "engine".to_string()
     }
 
-    fn build_ui(&mut self, ctx: &egui::Context, current_fps: f64) {
-        egui::Window::new(Self::title()).show(ctx, |ui| {
+    fn build_ui(&mut self, ctx: &egui::Context, current_fps: f64, camera_info: &mut CameraInfo) {
+        egui::SidePanel::new(egui::panel::Side::Left, Self::title()).show(ctx, |ui| {
             ui.label(format!("FPS - {:.2}", current_fps));
 
             ui.separator();
@@ -96,10 +115,76 @@ impl EditorUI {
                 .striped(true)
                 .show(ui, |ui| {
                     ui.label("FOV");
-                    ui.add(Slider::new(&mut self.camera_info.camera_fov, 10.0..=120.0));
+                    // Modify the passed-in camera_info
+                    ui.add(Slider::new(&mut camera_info.camera_fov, 10.0..=120.0));
+                    ui.end_row(); // Good practice in grids
+
+                    // You could add more camera controls here if needed
+                    // e.g., sliders for position, target (though direct manipulation is better)
+                    ui.label("Camera Pos");
+                    ui.label(format!(
+                        "({:.1}, {:.1}, {:.1})",
+                        camera_info.camera_pos.x,
+                        camera_info.camera_pos.y,
+                        camera_info.camera_pos.z
+                    ));
+                    ui.end_row();
+
+                    ui.label("Camera Target");
+                    ui.label(format!(
+                        "({:.1}, {:.1}, {:.1})",
+                        camera_info.camera_target.x,
+                        camera_info.camera_target.y,
+                        camera_info.camera_target.z
+                    ));
+                    ui.end_row();
                 });
+
+            ui.separator();
+            ui.label("Controls:");
+            ui.label("RMB + Drag: Look");
+            ui.label("WASD: Move");
+            ui.label("Space: Up");
+            ui.label("Shift: Down");
+            ui.label("Hold RMB to activate controls.");
         });
+
+        // let mut tree = create_tree();
+        //
+        // egui::panel::SidePanel::new(egui::panel::Side::Left, Id::new("main_panel")).show(
+        //     ctx,
+        //     |ui| {
+        //         let mut behavior = TreeBehavior {};
+        //         tree.ui(&mut behavior, ui);
+        //     },
+        // );
     }
+}
+
+fn create_tree() -> egui_tiles::Tree<EditorUI> {
+    let mut next_view_nr = 0;
+    let mut gen_pane = || {
+        let pane = EditorUI {};
+        next_view_nr += 1;
+        pane
+    };
+
+    let mut tiles = egui_tiles::Tiles::default();
+
+    let mut tabs = vec![];
+    tabs.push({
+        let children = (0..7).map(|_| tiles.insert_pane(gen_pane())).collect();
+        tiles.insert_horizontal_tile(children)
+    });
+    tabs.push({
+        let cells = (0..11).map(|_| tiles.insert_pane(gen_pane())).collect();
+        tiles.insert_grid_tile(cells)
+    });
+    tabs.push(tiles.insert_pane(gen_pane()));
+
+    let root = tiles.insert_tab_tile(tabs);
+
+    egui_tiles::Tree::new("my_tree", root, tiles)
 }
 
 #[derive(Default)]
@@ -264,56 +349,10 @@ impl Application {
         let resource_manager = Arc::new(ResourceManager::new(instance.clone(), device.clone())?);
         info!("Resource Manager initialized.");
 
-        let vertices = vec![
-            // Define 8 vertices for a cube with positions and colors
-            // Make sure winding order is correct (e.g., counter-clockwise for front faces)
-            Vertex {
-                pos: Vec3::new(-0.5, -0.5, 0.5).into(),
-                color: Vec3::new(1.0, 0.0, 0.0).into(),
-            }, // Front bottom left 0
-            Vertex {
-                pos: Vec3::new(0.5, -0.5, 0.5).into(),
-                color: Vec3::new(0.0, 1.0, 0.0).into(),
-            }, // Front bottom right 1
-            Vertex {
-                pos: Vec3::new(0.5, 0.5, 0.5).into(),
-                color: Vec3::new(0.0, 0.0, 1.0).into(),
-            }, // Front top right 2
-            Vertex {
-                pos: Vec3::new(-0.5, 0.5, 0.5).into(),
-                color: Vec3::new(1.0, 1.0, 0.0).into(),
-            }, // Front top left 3
-            // ... add back face vertices (4-7) ...
-            Vertex {
-                pos: Vec3::new(-0.5, -0.5, -0.5).into(),
-                color: Vec3::new(1.0, 0.0, 1.0).into(),
-            }, // Back bottom left 4
-            Vertex {
-                pos: Vec3::new(0.5, -0.5, -0.5).into(),
-                color: Vec3::new(0.0, 1.0, 1.0).into(),
-            }, // Back bottom right 5
-            Vertex {
-                pos: Vec3::new(0.5, 0.5, -0.5).into(),
-                color: Vec3::new(0.5, 0.5, 0.5).into(),
-            }, // Back top right 6
-            Vertex {
-                pos: Vec3::new(-0.5, 0.5, -0.5).into(),
-                color: Vec3::new(1.0, 1.0, 1.0).into(),
-            }, // Back top left 7
-        ];
-
-        let indices = vec![
-            // Define 12 triangles (36 indices) for the cube faces
-            // Front face
-            0, 1, 2, 2, 3, 0, // Right face
-            1, 5, 6, 6, 2, 1, // Back face
-            5, 4, 7, 7, 6, 5, // Left face
-            4, 0, 3, 3, 7, 4, // Top face
-            3, 2, 6, 6, 7, 3, // Bottom face
-            4, 5, 1, 1, 0, 4,
-        ];
-
-        let cube_geometry = Geometry::new(resource_manager.clone(), &vertices, &indices)?;
+        let scene = Scene::from_gltf(
+            "./sponza/NewSponza_Main_glTF_003.gltf",
+            resource_manager.clone(),
+        )?;
 
         // --- 5. Renderer ---
         let initial_size = window.inner_size();
@@ -323,7 +362,7 @@ impl Application {
             graphics_queue.clone(),
             surface.clone(),
             resource_manager.clone(),
-            vec![cube_geometry],
+            scene,
             initial_size.width,
             initial_size.height,
         )?;
@@ -341,6 +380,8 @@ impl Application {
 
         info!("Renderer initialized.");
 
+        let camera_info = CameraInfo::default(); // Get default camera settings
+
         Ok(Self {
             _instance: instance,
             _physical_device: physical_device,
@@ -353,6 +394,23 @@ impl Application {
             egui_winit,
             egui_ctx,
             egui_app,
+
+            // --- Camera ---
+            camera_info,               // Store the camera state here
+            camera_speed: 5.0,         // Adjust as needed
+            camera_sensitivity: 0.002, // Adjust as needed
+
+            // --- Input ---
+            is_forward_pressed: false,
+            is_backward_pressed: false,
+            is_left_pressed: false,
+            is_right_pressed: false,
+            is_up_pressed: false,
+            is_down_pressed: false,
+            is_rmb_pressed: false,
+            last_mouse_pos: None,
+            mouse_delta: (0.0, 0.0),
+            capture_mouse: false, // Start with mouse free
             frame_count: 0,
             current_fps: 0.,
             last_fps_update_time: Instant::now(),
@@ -361,7 +419,11 @@ impl Application {
     }
 
     fn handle_event(&mut self, event: &WindowEvent, active_event_loop: &ActiveEventLoop) {
-        let _ = self.egui_winit.on_window_event(&self.window, event);
+        // Let egui process the event first
+        let egui_consumed_event = self.egui_winit.on_window_event(&self.window, event);
+
+        // Only process input for camera if egui didn't consume it AND we are capturing
+        let process_camera_input = !egui_consumed_event.consumed && self.capture_mouse;
 
         match event {
             WindowEvent::CloseRequested => {
@@ -385,28 +447,126 @@ impl Application {
                     .resize(new_inner_size.width, new_inner_size.height);
             }
             // Handle other inputs if not consumed by egui
-            WindowEvent::KeyboardInput { .. }
-            | WindowEvent::CursorMoved { .. }
-            | WindowEvent::MouseInput { .. } => {}
+            WindowEvent::MouseInput { state, button, .. } => {
+                if *button == MouseButton::Right {
+                    let is_pressed = *state == ElementState::Pressed;
+                    self.is_rmb_pressed = is_pressed;
+
+                    // Decide whether to capture/release mouse based on RMB
+                    // Only capture if pressed *outside* an egui interactive area
+                    if is_pressed && !self.egui_ctx.is_pointer_over_area() {
+                        self.capture_mouse = true;
+                        self.window
+                            .set_cursor_grab(winit::window::CursorGrabMode::Confined)
+                            .or_else(|_| {
+                                self.window
+                                    .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                            })
+                            .unwrap_or(());
+                        self.window.set_cursor_visible(false);
+                        self.last_mouse_pos = None; // Reset last pos on capture start
+                    } else if !is_pressed {
+                        self.capture_mouse = false;
+                        self.window
+                            .set_cursor_grab(winit::window::CursorGrabMode::None)
+                            .unwrap_or(());
+                        self.window.set_cursor_visible(true);
+                        self.mouse_delta = (0.0, 0.0); // Stop camera movement
+                    }
+                }
+                // Let egui handle its mouse clicks regardless of capture state
+                // (handled by on_window_event)
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                let current_pos = (position.x, position.y);
+                if self.capture_mouse {
+                    // Only calculate delta if capturing
+                    if let Some(last_pos) = self.last_mouse_pos {
+                        self.mouse_delta.0 += current_pos.0 - last_pos.0;
+                        self.mouse_delta.1 += current_pos.1 - last_pos.1;
+                    }
+                    // Store position relative to window center might be more robust
+                    // with set_cursor_position, but this works with grab/confine too.
+                    self.last_mouse_pos = Some(current_pos);
+                } else {
+                    // Still update egui's pointer position even if not capturing
+                    // (handled by on_window_event)
+                    self.last_mouse_pos = None; // Reset if not capturing
+                }
+            }
+
+            // Use PhysicalKey for layout-independent keys
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key,
+                        state,
+                        ..
+                    },
+                ..
+            } => {
+                // Let egui handle keyboard input first if it wants it
+                if egui_consumed_event.consumed {
+                    return;
+                }
+
+                let is_pressed = *state == ElementState::Pressed;
+                match physical_key {
+                    PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
+                        self.is_forward_pressed = is_pressed;
+                    }
+                    PhysicalKey::Code(KeyCode::KeyS) | PhysicalKey::Code(KeyCode::ArrowDown) => {
+                        self.is_backward_pressed = is_pressed;
+                    }
+                    PhysicalKey::Code(KeyCode::KeyA) | PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                        self.is_left_pressed = is_pressed;
+                    }
+                    PhysicalKey::Code(KeyCode::KeyD) | PhysicalKey::Code(KeyCode::ArrowRight) => {
+                        self.is_right_pressed = is_pressed;
+                    }
+                    PhysicalKey::Code(KeyCode::Space) => {
+                        self.is_up_pressed = is_pressed;
+                    }
+                    PhysicalKey::Code(KeyCode::ShiftLeft)
+                    | PhysicalKey::Code(KeyCode::ShiftRight) => {
+                        self.is_down_pressed = is_pressed;
+                    }
+                    // Optional: Escape to release mouse capture
+                    PhysicalKey::Code(KeyCode::Escape) if is_pressed && self.capture_mouse => {
+                        self.capture_mouse = false;
+                        self.is_rmb_pressed = false; // Ensure RMB state is also reset
+                        self.window
+                            .set_cursor_grab(winit::window::CursorGrabMode::None)
+                            .unwrap_or(());
+                        self.window.set_cursor_visible(true);
+                        self.mouse_delta = (0.0, 0.0);
+                    }
+                    _ => {}
+                }
+            }
 
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let _delta_time = now.duration_since(self.last_frame_time);
+                let delta_time = now.duration_since(self.last_frame_time).as_secs_f32();
                 self.last_frame_time = now;
 
-                let elapsed_sice_last_update = now.duration_since(self.last_fps_update_time);
+                // --- FPS Calculation ---
+                let elapsed_since_last_update = now.duration_since(self.last_fps_update_time);
                 self.frame_count += 1;
-
-                if elapsed_sice_last_update >= Duration::from_secs(1) {
-                    let fps = self.frame_count as f64 / elapsed_sice_last_update.as_secs_f64();
-                    self.current_fps = fps;
-
-                    let new_title = format!("{} - {} - {:.0} FPS", ENGINE_NAME, APP_NAME, fps);
+                if elapsed_since_last_update >= Duration::from_secs(1) {
+                    self.current_fps =
+                        self.frame_count as f64 / elapsed_since_last_update.as_secs_f64();
+                    let new_title = format!(
+                        "{} - {} - {:.0} FPS",
+                        ENGINE_NAME, APP_NAME, self.current_fps
+                    );
                     self.window.set_title(&new_title);
-
                     self.frame_count = 0;
                     self.last_fps_update_time = now;
                 }
+
+                self.update_camera(delta_time); // Call the new update function
 
                 let raw_input = self.egui_winit.take_egui_input(&self.window);
 
@@ -417,7 +577,8 @@ impl Application {
                     pixels_per_point,
                     ..
                 } = self.egui_ctx.run(raw_input, |ctx| {
-                    self.egui_app.build_ui(ctx, self.current_fps);
+                    self.egui_app
+                        .build_ui(ctx, self.current_fps, &mut self.camera_info);
                 });
 
                 self.renderer.update_textures(textures_delta).unwrap();
@@ -431,7 +592,7 @@ impl Application {
                 match self.renderer.render_frame(
                     pixels_per_point,
                     &clipped_primitives,
-                    self.egui_app.camera_info,
+                    self.camera_info,
                 ) {
                     Ok(_) => {
                         self.window.request_redraw();
@@ -453,6 +614,106 @@ impl Application {
             }
             _ => {}
         }
+    }
+
+    // --- New Camera Update Function ---
+    fn update_camera(&mut self, dt: f32) {
+        if !self.capture_mouse
+            && self.mouse_delta == (0.0, 0.0)
+            && !self.is_forward_pressed
+            && !self.is_backward_pressed
+            && !self.is_left_pressed
+            && !self.is_right_pressed
+            && !self.is_up_pressed
+            && !self.is_down_pressed
+        {
+            return; // No input, no update needed
+        }
+
+        let mut cam_pos = self.camera_info.camera_pos;
+        let mut cam_target = self.camera_info.camera_target;
+        let cam_up = self.camera_info.camera_up; // Usually Vec3::Y
+
+        // --- Mouse Look (Rotation) ---
+        if self.capture_mouse && self.mouse_delta != (0.0, 0.0) {
+            let (delta_x, delta_y) = self.mouse_delta;
+            self.mouse_delta = (0.0, 0.0); // Consume the delta
+
+            let sensitivity = self.camera_sensitivity;
+            let yaw_delta = delta_x as f32 * sensitivity;
+            let pitch_delta = delta_y as f32 * sensitivity;
+
+            let forward_dir = (cam_target - cam_pos).normalize();
+            let right_dir = forward_dir.cross(cam_up).normalize();
+            // Recalculate up to prevent roll if needed, though cross product handles it here
+            let current_up = right_dir.cross(forward_dir).normalize();
+
+            // --- Pitch (Up/Down) ---
+            // Calculate new forward direction based on pitch rotation around right axis
+            let pitch_quat = glam::Quat::from_axis_angle(right_dir, -pitch_delta); // Negative for standard mouse look
+            let mut new_forward = pitch_quat * forward_dir;
+
+            // Clamp pitch to avoid flipping over (e.g., +/- 89 degrees)
+            let max_pitch_angle = 89.0f32.to_radians();
+            let current_pitch = new_forward.angle_between(cam_up) - 90.0f32.to_radians();
+            if current_pitch.abs() > max_pitch_angle {
+                // Revert pitch if it exceeds limits
+                new_forward = forward_dir; // Keep previous forward if clamp needed
+            }
+
+            // --- Yaw (Left/Right) ---
+            // Rotate the (potentially pitch-adjusted) forward direction and right vector around the global up axis (Y)
+            let yaw_quat = glam::Quat::from_axis_angle(Vec3::Y, -yaw_delta); // Negative for standard mouse look
+            new_forward = yaw_quat * new_forward;
+
+            // Update target based on the new forward direction
+            cam_target = cam_pos + new_forward;
+
+            // Update the camera's internal up vector based on yaw rotation as well
+            // This prevents weird tilting when looking straight up/down if up wasn't Vec3::Y
+            // self.camera_info.camera_up = yaw_quat * current_up; // Optional: only if up can change
+        }
+
+        // --- Keyboard Movement ---
+        let forward_dir = (cam_target - cam_pos).normalize();
+        // Use Vec3::Y for world-relative right/up movement, or calculate from forward/up
+        let right_dir = forward_dir.cross(Vec3::Y).normalize();
+        // let up_dir = right_dir.cross(forward_dir).normalize(); // Camera's local up
+        let world_up_dir = Vec3::Y; // Use world up for space/shift
+
+        let effective_speed = self.camera_speed * dt;
+        let mut move_delta = Vec3::ZERO;
+
+        if self.is_forward_pressed {
+            move_delta += forward_dir;
+        }
+        if self.is_backward_pressed {
+            move_delta -= forward_dir;
+        }
+        if self.is_left_pressed {
+            move_delta -= right_dir;
+        }
+        if self.is_right_pressed {
+            move_delta += right_dir;
+        }
+        if self.is_up_pressed {
+            move_delta += world_up_dir; // Move along world Y
+        }
+        if self.is_down_pressed {
+            move_delta -= world_up_dir; // Move along world Y
+        }
+
+        // Normalize move_delta if non-zero to ensure consistent speed diagonally
+        if move_delta != Vec3::ZERO {
+            let move_vec = move_delta.normalize() * effective_speed;
+            cam_pos += move_vec;
+            cam_target += move_vec; // Move target along with position
+        }
+
+        // --- Apply Changes ---
+        self.camera_info.camera_pos = cam_pos;
+        self.camera_info.camera_target = cam_target;
+        // self.camera_info.camera_up remains Vec3::Y usually
     }
 }
 

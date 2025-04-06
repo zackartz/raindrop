@@ -17,6 +17,7 @@ winit.workspace = true
 gfx_hal = { path = "../gfx_hal" }
 resource_manager = { path = "../resource_manager" }
 shared = { path = "../shared" }
+scene = { path = "../scene" }
 
 [build-dependencies]
 shaderc = "0.9.1"

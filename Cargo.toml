@@ -5,7 +5,9 @@ members = [
   "crates/engine",
   "crates/gfx_hal",
   "crates/renderer",
-  "crates/resource_manager", "crates/shared",
+  "crates/resource_manager",
+  "crates/scene",
+  "crates/shared",
 ]
 
 [workspace.dependencies]
@@ -24,10 +26,12 @@ egui-ash-renderer = { version = "0.8.0", features = [
   "dynamic-rendering",
 ] }
 egui = "0.31"
+egui_tiles = "0.12"
 bytemuck = { version = "1.21.0", features = ["derive"] }
-tracing = "0.1"
+tracing = { features = ["release_max_level_warn"], version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["json"] }
 thiserror = "2.0.12"
+gltf = "1.4.1"
 
 
 # # Enable incremental by default in release mode.
@@ -56,4 +60,7 @@ thiserror = "2.0.12"
 #
 # rustflags = ["-Zshare-generics=off"]
 # codegen-units = 1
+opt-level = 1
+
+[profile.dev.package."*"]
 opt-level = 3

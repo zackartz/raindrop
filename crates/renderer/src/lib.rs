@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::c_void,
     mem,
     sync::{Arc, Mutex},
@@ -17,12 +18,15 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc, Allocator},
     MemoryLocation,
 };
-use resource_manager::{Geometry, ImageHandle, ResourceManager, ResourceManagerError};
+use resource_manager::{
+    ImageHandle, Material, ResourceManager, ResourceManagerError, SamplerHandle, Texture,
+};
 use shared::{CameraInfo, UniformBufferObject};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const MAX_MATERIALS: usize = 150;
 
 #[derive(Debug, Error)]
 pub enum RendererError {
@@ -60,6 +64,9 @@ pub enum RendererError {
     AllocatorUnavailable, // Added based on egui requirement
     #[error("Allocator Error: {0}")]
     AllocatorError(#[from] gpu_allocator::AllocationError),
+
+    #[error("Other Error: {0}")]
+    Other(String),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for RendererError {
@@ -101,10 +108,12 @@ pub struct Renderer {
     swapchain_format: vk::SurfaceFormatKHR,
     swapchain_extent: vk::Extent2D,
 
-    scene: Vec<Geometry>,
+    scene: scene::Scene,
 
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
+
+    material_descriptor_set_layout: vk::DescriptorSetLayout,
 
     egui_renderer: EguiRenderer,
 
@@ -114,6 +123,11 @@ pub struct Renderer {
 
     model_pipeline_layout: vk::PipelineLayout,
     model_pipeline: vk::Pipeline,
+
+    material_descriptor_sets: HashMap<usize, vk::DescriptorSet>,
+
+    default_white_texture: Option<Arc<Texture>>,
+    default_sampler: SamplerHandle,
 
     frames_data: Vec<FrameData>,
     current_frame: usize,
@@ -134,7 +148,7 @@ impl Renderer {
         graphics_queue: Arc<Queue>,
         surface: Arc<Surface>,
         resource_manager: Arc<ResourceManager>,
-        scene: Vec<Geometry>,
+        scene: scene::Scene,
         initial_width: u32,
         initial_height: u32,
     ) -> Result<Self, RendererError> {
@@ -154,14 +168,18 @@ impl Renderer {
         let (depth_image_handle, depth_image_view) =
             Self::create_depth_resources(&device, &resource_manager, extent, depth_format)?;
 
-        let (descriptor_set_layout, descriptor_pool) =
-            Self::create_descriptor_sets_resources(&device)?;
+        let descriptor_set_layout = Self::create_descriptor_set_layout(&device)?;
+        let material_descriptor_set_layout = Self::create_material_descriptor_set_layout(&device)?;
+
+        let descriptor_set_layouts = [descriptor_set_layout, material_descriptor_set_layout];
+
+        let descriptor_pool = Self::create_descriptor_pool(&device)?;
 
         let (model_pipeline_layout, model_pipeline) = Self::create_model_pipeline(
             &device,
             format.format,
             depth_format,
-            descriptor_set_layout,
+            &descriptor_set_layouts,
         )?;
 
         let start_time = Instant::now();
@@ -170,9 +188,8 @@ impl Renderer {
             &device,
             &resource_manager,
             descriptor_pool,
-            descriptor_set_layout,
+            &descriptor_set_layouts,
             swapchain.extent(),
-            start_time,
         )?;
 
         info!("Renderer initialized successfully.");
@@ -191,6 +208,13 @@ impl Renderer {
             },
         )?;
 
+        let default_sampler = resource_manager.get_or_create_sampler(&Default::default())?;
+
+        let default_white_texture = Some(Self::create_default_texture(
+            device.clone(),
+            resource_manager.clone(),
+        ));
+
         Ok(Self {
             device,
             graphics_queue,
@@ -204,11 +228,19 @@ impl Renderer {
             swapchain_extent: extent,
             descriptor_set_layout,
             descriptor_pool,
+
+            material_descriptor_set_layout,
             depth_image_handle,
             depth_image_view,
             depth_format,
             model_pipeline_layout,
             model_pipeline,
+
+            material_descriptor_sets: HashMap::new(),
+
+            default_white_texture,
+            default_sampler,
+
             frames_data,
             scene,
             current_frame: 0,
@@ -217,6 +249,134 @@ impl Renderer {
             current_height: initial_height,
 
             start_time,
+        })
+    }
+
+    /// Gets or creates/updates a descriptor set for a given material.
+    fn get_or_create_material_set(
+        &mut self,
+        material: &Arc<Material>, // Use Arc<Material> directly if hashable, or use a unique ID
+    ) -> Result<vk::DescriptorSet, RendererError> {
+        // Return generic error
+
+        // Use a unique identifier for the material instance if Arc<Material> isn't directly hashable
+        // or if pointer comparison isn't reliable across runs/reloads.
+        // For simplicity here, we use the Arc's pointer address as a key.
+        // WARNING: This is only safe if the Arc<Material> instances are stable!
+        // A better key might be derived from material.name or a generated ID.
+        let material_key = Arc::as_ptr(material) as usize;
+
+        if let Some(set) = self.material_descriptor_sets.get(&material_key) {
+            return Ok(*set);
+        }
+
+        // --- Allocate Descriptor Set ---
+        let layouts = [self.material_descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&layouts);
+
+        let descriptor_set = unsafe { self.device.raw().allocate_descriptor_sets(&alloc_info)? }[0];
+
+        // --- Update Descriptor Set ---
+        let (image_handle, view_handle, sampler_handle) = match &material.base_color_texture {
+            Some(texture) => {
+                // Get the default view handle associated with the image
+                let img_info = self.resource_manager.get_image_info(texture.handle)?;
+                let view_h = img_info.default_view_handle.ok_or(RendererError::Other(
+                    "Image missing default view handle".to_string(),
+                ))?;
+                // Use the sampler specified by the material, or the default
+                let sampler_h = material.base_color_sampler.unwrap_or(self.default_sampler);
+                (texture.handle, view_h, sampler_h)
+            }
+            None => {
+                // Use default white texture
+                let default_tex =
+                    self.default_white_texture
+                        .as_ref()
+                        .ok_or(RendererError::Other(
+                            "Default texture not created".to_string(),
+                        ))?;
+                let img_info = self.resource_manager.get_image_info(default_tex.handle)?;
+                let view_h = img_info.default_view_handle.ok_or(RendererError::Other(
+                    "Default image missing default view handle".to_string(),
+                ))?;
+                (default_tex.handle, view_h, self.default_sampler)
+            }
+        };
+
+        // Get the actual Vulkan handles
+        let image_view_info = self.resource_manager.get_image_view_info(view_handle)?;
+        let sampler_info = self.resource_manager.get_sampler_info(sampler_handle)?;
+
+        let image_descriptor_info = vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) // Expected layout for sampling
+            .image_view(image_view_info.view) // The vk::ImageView
+            .sampler(sampler_info.sampler); // The vk::Sampler
+
+        let writes = [
+            // Write for binding 0 (baseColorSampler)
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&image_descriptor_info)),
+            // Add writes for other bindings (normal map, etc.) here
+        ];
+
+        unsafe {
+            self.device.raw().update_descriptor_sets(&writes, &[]); // Update the set
+        }
+
+        // Store in cache
+        self.material_descriptor_sets
+            .insert(material_key, descriptor_set);
+        Ok(descriptor_set)
+    }
+
+    fn create_default_texture(
+        device: Arc<Device>, // Need device Arc for RM
+        resource_manager: Arc<ResourceManager>,
+    ) -> Arc<Texture> {
+        let width = 1;
+        let height = 1;
+        let data = [255u8, 255, 255, 255]; // White RGBA
+        let format = vk::Format::R8G8B8A8_UNORM; // Or SRGB if preferred
+
+        let create_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let handle = resource_manager
+            .create_image_init(
+                &create_info,
+                gpu_allocator::MemoryLocation::GpuOnly,
+                vk::ImageAspectFlags::COLOR,
+                &data,
+            )
+            .expect("Failed to create default white texture");
+
+        Arc::new(Texture {
+            handle,
+            format: vk::Format::R8G8B8A8_UNORM,
+            extent: vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
         })
     }
 
@@ -425,9 +585,7 @@ impl Renderer {
                 .cmd_set_scissor(command_buffer, 0, &[scissor]);
         }
 
-        // --- Draw Triangle ---
         unsafe {
-            // Need unsafe for Vulkan commands
             self.device.raw().cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -444,9 +602,47 @@ impl Renderer {
             );
         }
 
-        for g in &self.scene {
-            g.draw(self.device.raw(), command_buffer)?;
+        let meshes = self.scene.meshes.clone();
+
+        for mesh in meshes {
+            let material_set = self.get_or_create_material_set(&mesh.material)?;
+
+            unsafe {
+                self.device.raw().cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.model_pipeline_layout,
+                    1,
+                    &[material_set],
+                    &[],
+                );
+            }
+
+            let model_matrix_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    mesh.transform.as_ref().as_ptr() as *const u8,
+                    std::mem::size_of::<Mat4>(),
+                )
+            };
+
+            unsafe {
+                self.device.raw().cmd_push_constants(
+                    command_buffer,
+                    self.model_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    model_matrix_bytes,
+                );
+            }
+
+            mesh.geometry.draw(self.device.raw(), command_buffer)?;
         }
+
+        let frame_data = &mut self.frames_data[self.current_frame];
+        let swapchain_ref = self
+            .swapchain
+            .as_ref()
+            .ok_or(RendererError::SwapchainAcquisitionFailed)?;
 
         tracing::trace!("Rendering EGUI");
         self.egui_renderer.cmd_draw(
@@ -716,7 +912,7 @@ impl Renderer {
         device: &Arc<Device>,
         color_format: vk::Format,
         depth_format: vk::Format,
-        descriptor_set_layout: vk::DescriptorSetLayout,
+        descriptor_set_layouts: &[vk::DescriptorSetLayout],
     ) -> Result<(vk::PipelineLayout, vk::Pipeline), RendererError> {
         // Load compiled SPIR-V (replace with actual loading)
         let vert_shader_code = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/vert.glsl.spv")); // Placeholder path
@@ -787,9 +983,15 @@ impl Renderer {
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
+        let push_constant_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(mem::size_of::<Mat4>() as u32);
+
         // --- Pipeline Layout ---
         let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout)); // No descriptors/push constants
+            .set_layouts(descriptor_set_layouts)
+            .push_constant_ranges(std::slice::from_ref(&push_constant_range));
         let pipeline_layout = unsafe {
             device
                 .raw()
@@ -891,9 +1093,8 @@ impl Renderer {
         device: &Arc<Device>,
         resource_manager: &Arc<ResourceManager>,
         descriptor_pool: vk::DescriptorPool,
-        descriptor_set_layout: vk::DescriptorSetLayout,
+        descriptor_set_layouts: &[vk::DescriptorSetLayout],
         swapchain_extent: vk::Extent2D,
-        instant: Instant,
     ) -> Result<Vec<FrameData>, RendererError> {
         let mut frames_data = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
@@ -930,15 +1131,14 @@ impl Renderer {
             tracing::info!("Allocated frame_data command_buffer: {:?}", command_buffer);
 
             let descriptor_set =
-                Self::create_descriptor_set(device, descriptor_set_layout, descriptor_pool)?;
+                Self::create_descriptor_set(device, descriptor_set_layouts, descriptor_pool)?;
 
             let (uniform_buffer, uniform_buffer_allocation, uniform_buffer_mapped_ptr) =
                 Self::create_uniform_buffer(device, resource_manager)?;
 
             Self::update_descriptor_set(device.clone(), descriptor_set, uniform_buffer);
 
-            let uniform_buffer_object =
-                calculate_ubo(CameraInfo::default(), swapchain_extent, instant);
+            let uniform_buffer_object = calculate_ubo(CameraInfo::default(), swapchain_extent);
 
             frames_data.push(FrameData {
                 textures_to_free: None,
@@ -1043,9 +1243,37 @@ impl Renderer {
         ))
     }
 
-    fn create_descriptor_sets_resources(
+    fn create_material_descriptor_set_layout(
         device: &Arc<Device>,
-    ) -> Result<(vk::DescriptorSetLayout, vk::DescriptorPool), RendererError> {
+    ) -> Result<vk::DescriptorSetLayout, RendererError> {
+        let bindings = [
+            // Binding 0: Combined Image Sampler (baseColorSampler)
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT), // Used in fragment shader
+                                                              // Add more bindings here if needed (e.g., for normal map, metallic/roughness map)
+                                                              // Binding 1: Uniform Buffer (Optional: for material factors)
+                                                              // vk::DescriptorSetLayoutBinding::default()
+                                                              //     .binding(1)
+                                                              //     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                                              //     .descriptor_count(1)
+                                                              //     .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+
+        Ok(unsafe {
+            device
+                .raw()
+                .create_descriptor_set_layout(&layout_info, None)?
+        })
+    }
+
+    fn create_descriptor_set_layout(
+        device: &Arc<Device>,
+    ) -> Result<vk::DescriptorSetLayout, RendererError> {
         let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -1061,29 +1289,38 @@ impl Renderer {
                 .create_descriptor_set_layout(&layout_info, None)?
         };
 
-        let pool_size = vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::UNIFORM_BUFFER,
-            descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
-        };
+        Ok(descriptor_set_layout)
+    }
+
+    fn create_descriptor_pool(device: &Arc<Device>) -> Result<vk::DescriptorPool, RendererError> {
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: MAX_MATERIALS as u32,
+            },
+        ];
 
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(std::slice::from_ref(&pool_size))
-            .max_sets(MAX_FRAMES_IN_FLIGHT as u32);
+            .pool_sizes(&pool_sizes)
+            .max_sets(MAX_FRAMES_IN_FLIGHT as u32 + MAX_MATERIALS as u32);
 
         let descriptor_pool = unsafe { device.raw().create_descriptor_pool(&pool_info, None)? };
 
-        Ok((descriptor_set_layout, descriptor_pool))
+        Ok(descriptor_pool)
     }
 
     fn create_descriptor_set(
         device: &Arc<Device>,
-        descriptor_set_layout: vk::DescriptorSetLayout,
+        descriptor_set_layouts: &[vk::DescriptorSetLayout],
         descriptor_pool: vk::DescriptorPool,
     ) -> Result<vk::DescriptorSet, RendererError> {
-        let layouts = vec![descriptor_set_layout; 1];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
-            .set_layouts(&layouts);
+            .set_layouts(descriptor_set_layouts);
 
         let descriptor_set = unsafe { device.raw().allocate_descriptor_sets(&alloc_info)? }[0];
 
@@ -1167,7 +1404,7 @@ impl Renderer {
     fn update_uniform_buffer(&mut self, camera_info: CameraInfo) -> Result<(), RendererError> {
         let frame_data = &mut self.frames_data[self.current_frame];
 
-        let ubo = calculate_ubo(camera_info, self.swapchain_extent, self.start_time);
+        let ubo = calculate_ubo(camera_info, self.swapchain_extent);
 
         if frame_data.uniform_buffer_object != ubo {
             let ptr = frame_data.uniform_buffer_mapped_ptr;
@@ -1181,15 +1418,7 @@ impl Renderer {
     }
 }
 
-fn calculate_ubo(
-    camera_info: CameraInfo,
-    swapchain_extent: vk::Extent2D,
-    start: Instant,
-) -> UniformBufferObject {
-    let time = start.elapsed();
-
-    let model = Mat4::from_rotation_y(time.as_secs_f32());
-
+fn calculate_ubo(camera_info: CameraInfo, swapchain_extent: vk::Extent2D) -> UniformBufferObject {
     let view = Mat4::look_at_rh(camera_info.camera_pos, camera_info.camera_target, Vec3::Y);
 
     let mut proj = Mat4::perspective_rh(
@@ -1201,7 +1430,7 @@ fn calculate_ubo(
 
     proj.y_axis.y *= -1.0;
 
-    UniformBufferObject { model, view, proj }
+    UniformBufferObject { view, proj }
 }
 
 // --- Drop Implementation ---

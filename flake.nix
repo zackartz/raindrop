@@ -35,11 +35,12 @@
         commonArgs,
         ...
       }: {
-        _module.args = {
+        _module.args = rec {
           pkgs = import nixpkgs {
             inherit system;
             overlays = [inputs.rust-overlay.overlays.default];
           };
+
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain (
             pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml
           );

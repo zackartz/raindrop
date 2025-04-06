@@ -13,6 +13,7 @@ unsafe fn as_byte_slice<T: Sized>(data: &[T]) -> &[u8] {
 
 /// Represents geometry data (verticies and indicies) stored in GPU buffers managed by
 /// ResourceManager. Handles automatic cleanup via a `Drop` implementation.
+#[derive(Clone)]
 pub struct Geometry {
     resource_manager: Arc<ResourceManager>,
     pub vertex_buffer: BufferHandle,

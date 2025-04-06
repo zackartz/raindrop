@@ -34,6 +34,12 @@ pub enum ResourceManagerError {
     #[error("Error occurred in GfxHal: {0}")]
     GfxHalError(#[from] gfx_hal::error::GfxHalError),
 
+    #[error("I/O Error occurred: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Image Error occurred: {0}")]
+    ImageError(#[from] image::ImageError),
+
     #[error("An unexpected error occurred: {0}")]
     Other(String),
 }
